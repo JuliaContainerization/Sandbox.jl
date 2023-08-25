@@ -79,7 +79,9 @@ function select_executor(verbose::Bool)
             return executor
         end
     end
-    error("Could not find any available executors for $(triplet(HostPlatform()))!")
+    error("""Could not find any available executors for $(triplet(HostPlatform()))!
+             On Linux this could mean user namespaces are unavailable.
+             On macOS and Windows this could mean Docker is not installed.""")
 end
 
 _preferred_executor = nothing
