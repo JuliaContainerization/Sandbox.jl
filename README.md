@@ -57,3 +57,30 @@ Sandbox contains facilities for automatically registering `qemu-user-static` int
 As of the time of this writing, this is only supported on when running on a Linux host with the `x86_64`, `aarch64` or `powerpc64le` host architectures.
 The target architectures supported are `x86_64`, `i686`, `aarch64`, `armv7l` and `powerpc64le`.
 Note that while `qemu-user-static` is a marvel of modern engineering, it does still impose some performance penalties, and there may be occasional bugs that break emulation faithfulness.
+
+For example, to run an aarch64 (ARM v8):
+
+```julia
+using Base.BinaryPlatforms, Sandbox
+
+# We'll run for this platform
+aarch64 = Platform("aarch64", "linux")
+
+config = SandboxConfig(
+    # Map in a rootfs mounted at `/` that is Debian
+    Dict("/" => Sandbox.debian_rootfs(;platform=aarch64));
+    # Run using qemu-user-static/binfmt-misc
+    multiarch=[aarch64],
+
+    # Hook up stdout/stderr/stdin so we can be interactive
+    stdout, stderr, stdin,
+
+    # This works around some problems with cross-device links
+    # when installing things via `apt`
+    persist=true
+)
+
+with_executor() do exe
+    run(exe, config, `/bin/bash -l`)
+end
+```
