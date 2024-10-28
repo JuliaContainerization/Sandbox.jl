@@ -6,9 +6,9 @@
 [![Coverage][codecov-img]][codecov-url]
 
 [docs-stable-img]: https://img.shields.io/badge/docs-stable-blue.svg
-[docs-stable-url]: https://staticfloat.github.io/Sandbox.jl/stable
+[docs-stable-url]: https://juliacontainerization.github.io/Sandbox.jl/stable
 [docs-dev-img]: https://img.shields.io/badge/docs-dev-blue.svg
-[docs-dev-url]: https://staticfloat.github.io/Sandbox.jl/dev
+[docs-dev-url]: https://juliacontainerization.github.io/Sandbox.jl/dev
 [ci-img]: https://github.com/JuliaContainerization/Sandbox.jl/workflows/CI/badge.svg
 [ci-url]: https://github.com/JuliaContainerization/Sandbox.jl/actions/workflows/ci.yml
 [codecov-img]: https://codecov.io/gh/JuliaContainerization/Sandbox.jl/branch/master/graph/badge.svg
