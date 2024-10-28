@@ -1,6 +1,6 @@
 # Sandbox.jl Documentation
 
-[`Sandbox.jl`](https://github.com/staticfloat/Sandbox.jl) provides basic
+[`Sandbox.jl`](https://github.com/JuliaContainerization/Sandbox.jl) provides basic
 containerization tools for running Linux guests on a variety of platforms.
 
 ## Index

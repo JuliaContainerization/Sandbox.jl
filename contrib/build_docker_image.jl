@@ -25,13 +25,13 @@ archive_artifact(artifact_hash, tarball_path)
 @info("Hashing tarball")
 tarball_hash = open(io -> bytes2hex(sha256(io)), tarball_path)
 
-# Upload to `staticfloat/Sandbox.jl`, create a tag based on this docker image
+# Upload to `JuliaContainerization/Sandbox.jl`, create a tag based on this docker image
 tag_name = "$(image_name)-$(bytes2hex(artifact_hash.bytes[end-3:end]))"
-@info("Uploading to staticfloat/Sandbox.jl@$(tag_name)")
+@info("Uploading to JuliaContainerization/Sandbox.jl@$(tag_name)")
 run(`$(ghr_jll.ghr()) -replace $(tag_name) $(tarball_path)`)
 
 # Bind it into `Artifacts.toml`
-tarball_url = "https://github.com/staticfloat/Sandbox.jl/releases/download/$(tag_name)/$(basename(tarball_path))"
+tarball_url = "https://github.com/JuliaContainerization/Sandbox.jl/releases/download/$(tag_name)/$(basename(tarball_path))"
 bind_artifact!(
     joinpath(dirname(@__DIR__), "Artifacts.toml"),
     "$(image_name)-rootfs",

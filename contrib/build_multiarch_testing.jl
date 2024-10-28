@@ -39,11 +39,11 @@ archive_artifact(artifact_hash, tarball_path)
 @info("Hashing tarball")
 tarball_hash = open(io -> bytes2hex(sha256(io)), tarball_path)
 
-# Upload it to `staticfloat/Sandbox.jl`
+# Upload it to `JuliaContainerization/Sandbox.jl`
 tag_name = "multiarch-testing-$(bytes2hex(artifact_hash.bytes[end-3:end]))"
-@info("Uploading to staticfloat/Sandbox.jl@$(tag_name)")
+@info("Uploading to JuliaContainerization/Sandbox.jl@$(tag_name)")
 run(`$(ghr_jll.ghr()) -replace $(tag_name) $(tarball_path)`)
-tarball_url = "https://github.com/staticfloat/Sandbox.jl/releases/download/$(tag_name)/$(basename(tarball_path))"
+tarball_url = "https://github.com/JuliaContainerization/Sandbox.jl/releases/download/$(tag_name)/$(basename(tarball_path))"
 
 # Bind it into our Artifacts.toml (advertising support for both glibc and musl)
 bind_artifact!(
