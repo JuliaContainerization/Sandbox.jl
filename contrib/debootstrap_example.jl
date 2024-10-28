@@ -69,13 +69,13 @@ archive_artifact(artifact_hash, tarball_path)
 @info("Hashing tarball")
 tarball_hash = open(io -> bytes2hex(sha256(io)), tarball_path)
 
-# Upload it to `staticfloat/Sandbox.jl`
+# Upload it to `JuliaContainerization/Sandbox.jl`
 tag_name = "debian-minimal-$(bytes2hex(artifact_hash.bytes[end-3:end]))"
-@info("Uploading to staticfloat/Sandbox.jl@$(tag_name)")
+@info("Uploading to JuliaContainerization/Sandbox.jl@$(tag_name)")
 run(`$(ghr_jll.ghr()) -replace $(tag_name) $(tarball_path)`)
 
 # Bind this artifact into our Artifacts.toml
-tarball_url = "https://github.com/staticfloat/Sandbox.jl/releases/download/$(tag_name)/$(basename(tarball_path))"
+tarball_url = "https://github.com/JuliaContainerization/Sandbox.jl/releases/download/$(tag_name)/$(basename(tarball_path))"
 bind_artifact!(
     joinpath(dirname(@__DIR__), "Artifacts.toml"),
     "debian-minimal-rootfs",

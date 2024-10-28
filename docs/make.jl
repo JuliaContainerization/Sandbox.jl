@@ -6,7 +6,7 @@ makedocs(
 )
 
 deploydocs(
-    repo = "github.com/staticfloat/Sandbox.jl.git",
+    repo = "github.com/JuliaContainerization/Sandbox.jl.git",
     push_preview = true,
     devbranch = "main",
 )

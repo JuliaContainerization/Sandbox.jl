@@ -44,7 +44,7 @@ lazy = true
 
     [[multiarch-rootfs.download]]
     sha256 = "d88de5783becfc22cfd13dfa5ad965197f9bae2256e8ad89ff358adb2994b4c1"
-    url = "https://github.com/staticfloat/Sandbox.jl/releases/download/multiarch-78df527c/multiarch.tar.gz"
+    url = "https://github.com/JuliaContainerization/Sandbox.jl/releases/download/multiarch-78df527c/multiarch.tar.gz"
 
 [multiarch-testing]
 git-tree-sha1 = "d0e5365dc9e5083e1624a2733d0a8834dc9f14af"
@@ -52,7 +52,7 @@ lazy = true
 
     [[multiarch-testing.download]]
     sha256 = "0a3603e2e76f9614c6b9c6e5ba67a64a2442660718b5bbe1e07da08bee631f83"
-    url = "https://github.com/staticfloat/Sandbox.jl/releases/download/multiarch-testing-dc9f14af/multiarch-testing.tar.gz"
+    url = "https://github.com/JuliaContainerization/Sandbox.jl/releases/download/multiarch-testing-dc9f14af/multiarch-testing.tar.gz"
 
 [[qemu-aarch64]]
 arch = "x86_64"
