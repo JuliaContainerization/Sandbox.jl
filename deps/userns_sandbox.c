@@ -51,6 +51,7 @@ enum {
   MOUNT_TYPE_READWRITE,
   MOUNT_TYPE_READONLY,
   MOUNT_TYPE_OVERLAYED,
+  MOUNT_TYPE_OVERLAYED_READONLY,
 };
 
 // Linked list of volume mappings
@@ -177,15 +178,20 @@ static void mount_the_world(const char * root_dir,
     // setting the bind-mount to be read-only if requested.
     bind_mount(entry->outside_path,
                path,
-               entry->type == MOUNT_TYPE_READONLY || entry->type == MOUNT_TYPE_OVERLAYED);
+               entry->type == MOUNT_TYPE_READONLY || entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY);
 
     // If we're dealing with an overlayed mount, create a unique
     // name to store the state of this mount within our `persist_dir`.
-    if (entry->type == MOUNT_TYPE_OVERLAYED) {
+    if (entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
       char bname[PATH_MAX];
       hashed_basename(&bname[0], entry->mount_point);
       check(TRUE == mount_overlay(path, path, bname, persist_dir, userxattr));
       check(0 == chown(path, uid, gid));
+
+      // If this is a "read-only" overlay mount, remount as read-only here.
+      if (entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
+        check(0 == mount("overlay", path, "overlay", MS_REMOUNT|MS_RDONLY, ""));
+      }
     }
     entry = entry->prev;
   }
@@ -446,6 +452,8 @@ int main(int sandbox_argc, char **sandbox_argv) {
             mount_type = MOUNT_TYPE_READONLY;
           } else if (strcmp(mount_str, "ov") == 0) {
             mount_type = MOUNT_TYPE_OVERLAYED;
+          } else if (strcmp(mount_str, "rov") == 0) {
+            mount_type = MOUNT_TYPE_OVERLAYED_READONLY;
           } else if (strcmp(mount_str, "rw") == 0) {
             mount_type = MOUNT_TYPE_READWRITE;
           } else {

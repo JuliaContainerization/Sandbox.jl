@@ -5,6 +5,7 @@ const AnyRedirectable = Union{Base.AbstractCmd, Base.TTY, <:IO}
     ReadWrite
     ReadOnly
     Overlayed
+    OverlayedReadOnly
 end
 struct MountInfo
     host_path::String

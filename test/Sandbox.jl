@@ -99,7 +99,6 @@ for executor in all_executors
 
         @testset "writing to mounts" begin
             mktempdir() do dir
-                stdout = IOBuffer()
                 config = SandboxConfig(
                     Dict(
                         "/" => MountInfo(rootfs_dir, MountType.Overlayed),
@@ -110,6 +109,21 @@ for executor in all_executors
                     @test success(exe, config, `/bin/sh -c "echo aperture > /glados/science.txt"`)
                     @test isfile(joinpath(dir, "science.txt"))
                     @test String(read(joinpath(dir, "science.txt"))) == "aperture\n"
+                end
+            end
+        end
+
+        @testset "OverlayedReadOnly" begin
+            mktempdir() do dir
+                config = SandboxConfig(
+                    Dict(
+                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                        "/read_only" => MountInfo(dir, MountType.OverlayedReadOnly),
+                    );
+                )
+                with_executor(executor) do exe
+                    @test success(exe, config, `/bin/sh -c "[ -d /read_only ]"`)
+                    @test !success(exe, config, `/bin/sh -c "echo aperture > /read_only/error.txt 2>&1"`)
                 end
             end
         end
