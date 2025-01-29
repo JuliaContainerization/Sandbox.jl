@@ -28,5 +28,5 @@ steps:
     # Only run on agents that are already using `sandbox.jl`, as then we know we can nest
     agents:
       queue: "juliaecosystem"
-      sandbox.jl: "true"
+      sandbox_capable: "true"
       arch: "${ARCH}"
