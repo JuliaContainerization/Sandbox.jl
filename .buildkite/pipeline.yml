@@ -9,7 +9,7 @@ steps:
         elif [[ "$${ARCH}" == "aarch64" ]]; then
           ROOTFS_HASH="dcf39d10ba43bf13c75d5031c3a88f125780033b"
         fi
-        for JULIA_VERSION in 1.7 nightly; do
+        for JULIA_VERSION in 1.7 1 nightly; do
           for LOCAL_SANDBOX in true false; do
             buildkite-agent pipeline upload .buildkite/test_sandbox.yml
           done
