@@ -122,7 +122,8 @@ for executor in all_executors
                     );
                 )
                 with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "[ -d /read_only ]"`)
+                    # We don't support OverlayedReadOnly mounts on Docker right now
+                    @test success(exe, config, `/bin/sh -c "[ -d /read_only ]"`) broken=(executor == DockerExecutor)
                     @test !success(exe, config, `/bin/sh -c "echo aperture > /read_only/error.txt 2>&1"`)
                 end
             end
