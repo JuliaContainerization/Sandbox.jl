@@ -186,7 +186,7 @@ function build_executor_command(exe::DockerExecutor, config::SandboxConfig, user
         local mount_type_str
         if mount_info.type == MountType.ReadOnly
             mount_type_str = ":ro"
-        elseif mount_info.type == MountType.Overlayed
+        elseif mount_info.type ∈ (MountType.Overlayed, MountType.OverlayedReadOnly)
             continue
         elseif mount_info.type == MountType.ReadWrite
             mount_type_str = ""

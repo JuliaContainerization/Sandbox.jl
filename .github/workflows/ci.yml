@@ -35,9 +35,10 @@ jobs:
         env:
           SANDBOX_BUILD_LOCAL_SANDBOX: ${{ matrix.build-local-sandbox }}
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v1
+      - uses: codecov/codecov-action@v5
         with:
-          file: lcov.info
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   Documentation:
     runs-on: ubuntu-latest

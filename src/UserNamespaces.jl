@@ -161,6 +161,8 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
             mount_type_str = ":rw"
         elseif mount_info.type == MountType.Overlayed
             mount_type_str = ":ov"
+        elseif mount_info.type == MountType.OverlayedReadOnly
+            mount_type_str = ":rov"
         else
             throw(ArgumentError("Unknown mount type: $(mount_info.type)"))
         end
