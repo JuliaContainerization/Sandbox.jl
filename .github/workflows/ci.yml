@@ -25,6 +25,11 @@ jobs:
           - "false"
 
     steps:
+      - name: Allow creation of user namespaces (e.g. to the unshare command)
+        run: |
+          # .. so that we don't get error:
+          # Idea from https://github.com/YoYoGames/GameMaker-Bugs/issues/6015#issuecomment-2135552784
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
