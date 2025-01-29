@@ -5,7 +5,7 @@ steps:
       - JuliaCI/julia#v1:
           version: "${JULIA_VERSION}"
       # Run inside of a rootfs that allows us to build the local sandbox, also that maps to a non-zero UID
-      - staticfloat/sandbox#v1:
+      - staticfloat/sandbox#v2:
           rootfs_url: "${ROOTFS_URL?}"
           rootfs_treehash: "${ROOTFS_HASH?}"
           uid: 1000
