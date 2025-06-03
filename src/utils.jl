@@ -350,6 +350,7 @@ function find_persist_dir_root(rootfs_path::String, dir_hints::Vector{String} = 
         "securityfs",
         "sysfs",
         "tracefs",
+        "nsfs"
     ])
 
     mounts = first.(filter(((path, type),) -> type ∉ disallowed_mount_types, get_mounts()))
