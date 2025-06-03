@@ -171,7 +171,18 @@ function probe_executor(executor::SandboxExecutor; verbose::Bool = false)
 
         # Command should execute successfully
         user_cmd = ignorestatus(user_cmd)
-        if !success(run(executor, config, user_cmd))
+        proc = try
+            run(executor, config, user_cmd)
+        catch e
+            if isa(e, ArgumentError)
+                if verbose
+                    @warn("Unable to build executor command: ", e.msg)
+                end
+                return false
+            end
+            rethrow(e)
+        end
+        if !success(proc)
             if verbose
                 cmd_stdout = String(take!(cmd_stdout))
                 cmd_stderr = String(take!(cmd_stderr))
