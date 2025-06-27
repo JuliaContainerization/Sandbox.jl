@@ -179,7 +179,9 @@ function build_executor_command(exe::DockerExecutor, config::SandboxConfig, user
 
     # Add in read-only mappings (skipping the rootfs)
     overlay_mappings = String[]
-    for (sandbox_path, mount_info) in config.mounts
+    # Sort mounts by path length (shortest first) to ensure proper mounting order
+    sorted_mounts = sort(collect(config.mounts), by=x->length(x[1]))
+    for (sandbox_path, mount_info) in sorted_mounts
         if sandbox_path == "/"
             continue
         end
