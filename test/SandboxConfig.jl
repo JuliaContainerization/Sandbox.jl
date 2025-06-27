@@ -56,6 +56,46 @@ using Test, LazyArtifacts, Sandbox
         @test config.hostname == "sandy"
     end
 
+    @testset "copy constructor with stdio kwargs" begin
+        # Create an initial config
+        config1 = SandboxConfig(
+            Dict("/" => MountInfo(rootfs_dir, MountType.Overlayed)),
+            Dict("TEST_VAR" => "test_value");
+            pwd = "/home",
+            verbose = true,
+            hostname = "test-host"
+        )
+
+        # Test copying with modified stdout/stderr
+        io_buffer1 = IOBuffer()
+        io_buffer2 = IOBuffer()
+        config2 = SandboxConfig(config1; stdout=io_buffer1, stderr=io_buffer2)
+
+        # Check that all fields are preserved except stdio
+        @test config2.mounts == config1.mounts
+        @test config2.env == config1.env
+        @test config2.entrypoint == config1.entrypoint
+        @test config2.pwd == config1.pwd
+        @test config2.persist == config1.persist
+        @test config2.multiarch_formats == config1.multiarch_formats
+        @test config2.uid == config1.uid
+        @test config2.gid == config1.gid
+        @test config2.tmpfs_size == config1.tmpfs_size
+        @test config2.hostname == config1.hostname
+        @test config2.verbose == config1.verbose
+
+        # Check that stdio was modified
+        @test config2.stdin == config1.stdin  # unchanged
+        @test config2.stdout == io_buffer1
+        @test config2.stderr == io_buffer2
+
+        # Test copying with only one stdio changed
+        config3 = SandboxConfig(config1; stdin=io_buffer1)
+        @test config3.stdin == io_buffer1
+        @test config3.stdout == config1.stdout
+        @test config3.stderr == config1.stderr
+    end
+
     @testset "errors" begin
         # No root dir error
         @test_throws ArgumentError SandboxConfig(Dict("/rootfs" => rootfs_dir))
