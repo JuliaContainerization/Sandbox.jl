@@ -150,7 +150,9 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
     append!(cmd_string, ["--cd", config.pwd])
 
     # Add in read-only mappings (skipping the rootfs)
-    for (sandbox_path, mount_info) in config.mounts
+    # Sort mounts by path length (longest first) because userns processes mounts back to front
+    sorted_mounts = sort(collect(config.mounts), by=x->length(x[1]), rev=true)
+    for (sandbox_path, mount_info) in sorted_mounts
         if sandbox_path == "/"
             continue
         end
