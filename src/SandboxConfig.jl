@@ -135,7 +135,18 @@ struct SandboxConfig
 
         return new(mounts, env, entrypoint, pwd, persist, collect(multiarch_formats), Cint(uid), Cint(gid), tmpfs_size, hostname, stdin, stdout, stderr, verbose)
     end
+
+    # Inner constructor that takes an existing SandboxConfig and allows modifying stdio
+    function SandboxConfig(config::SandboxConfig;
+                           stdin::AnyRedirectable = config.stdin,
+                           stdout::AnyRedirectable = config.stdout,
+                           stderr::AnyRedirectable = config.stderr)
+        return new(config.mounts, config.env, config.entrypoint, config.pwd,
+                   config.persist, config.multiarch_formats, config.uid, config.gid,
+                   config.tmpfs_size, config.hostname, stdin, stdout, stderr, config.verbose)
+    end
 end
+
 
 # Compatibility shim for `read_only_maps`/`read_write_maps` API:
 function SandboxConfig(read_only_maps::Dict{String,String},
