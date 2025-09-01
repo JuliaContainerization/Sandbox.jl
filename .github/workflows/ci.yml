@@ -30,7 +30,7 @@ jobs:
           # .. so that we don't get error:
           # Idea from https://github.com/YoYoGames/GameMaker-Bugs/issues/6015#issuecomment-2135552784
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.julia-version }}
@@ -48,7 +48,7 @@ jobs:
   Documentation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: julia-actions/setup-julia@v2
         with:
           version: "^1.7.0-0"
