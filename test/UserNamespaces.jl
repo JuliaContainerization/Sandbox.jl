@@ -94,6 +94,15 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
             @test String(take!(stdout)) == "received SIGINT\nreceived SIGTERM\n"
         end
     end
+
+    @testset "Extra fds" begin
+        config = SandboxConfig(Dict("/" => Sandbox.debian_rootfs()))
+        with_executor(UnprivilegedUserNamespacesExecutor) do exe
+            buf = IOBuffer()
+            @test success(exe, config, Base.CmdRedirect(`/bin/sh -c "echo hello >&3"`, buf, 3))
+            @test String(take!(buf)) == "hello\n"
+        end
+    end
 else
     @error("Skipping Unprivileged tests, as it does not seem to be available")
 end

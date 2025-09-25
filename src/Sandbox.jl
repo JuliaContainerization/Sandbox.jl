@@ -104,40 +104,40 @@ function warn_priviledged(::PrivilegedUserNamespacesExecutor)
 end
 warn_priviledged(::SandboxExecutor) = nothing
 
-for f in (:run, :success)
-    @eval begin
-        function $f(exe::SandboxExecutor, config::SandboxConfig, user_cmd::Cmd)
-            # This is for `stdin` because when precompiling, it is closed,
-            # which causes `run()` to throw an error.
-            open_or_devnull(io) = isopen(io) ? io : devnull
+function _run(run_or_success, exe::SandboxExecutor, config::SandboxConfig, user_cmd::Union{Cmd, Base.CmdRedirect})
+    # This is for `stdin` because when precompiling, it is closed,
+    # which causes `run()` to throw an error.
+    open_or_devnull(io) = isopen(io) ? io : devnull
 
-            # Because Julia 1.8+ closes IOBuffers like `stdout` and `stderr`, we create temporary
-            # IOBuffers that get copied over to the persistent `stdin`/`stdout` after the run is complete.
-            temp_stdout = isa(config.stdout, IOBuffer) ? IOBuffer() : config.stdout
-            temp_stderr = isa(config.stderr, IOBuffer) ? IOBuffer() : config.stderr
-            cmd = pipeline(
-                build_executor_command(exe, config, user_cmd);
-                stdin=open_or_devnull(config.stdin),
-                stdout=temp_stdout,
-                stderr=temp_stderr,
-            )
-            if config.verbose
-                @info("Running sandboxed command", user_cmd.exec)
-            end
-            warn_priviledged(exe)
-            ret = $f(cmd)
-
-            # If we were using temporary IOBuffers, write the result out to `config.std{out,err}`
-            if isa(temp_stdout, IOBuffer)
-                write(config.stdout, take!(temp_stdout))
-            end
-            if isa(temp_stderr, IOBuffer)
-                write(config.stderr, take!(temp_stderr))
-            end
-            return ret
-        end
+    # Because Julia 1.8+ closes IOBuffers like `stdout` and `stderr`, we create temporary
+    # IOBuffers that get copied over to the persistent `stdin`/`stdout` after the run is complete.
+    temp_stdout = isa(config.stdout, IOBuffer) ? IOBuffer() : config.stdout
+    temp_stderr = isa(config.stderr, IOBuffer) ? IOBuffer() : config.stderr
+    cmd = pipeline(
+        build_executor_command(exe, config, user_cmd);
+        stdin=open_or_devnull(config.stdin),
+        stdout=temp_stdout,
+        stderr=temp_stderr,
+    )
+    if config.verbose
+        base_cmd = user_cmd
+        while isa(base_cmd, Base.CmdRedirect); base_cmd = base_cmd.cmd; end
+        @info("Running sandboxed command", base_cmd.exec)
     end
+    warn_priviledged(exe)
+    ret = run_or_success(cmd)
+
+    # If we were using temporary IOBuffers, write the result out to `config.std{out,err}`
+    if isa(temp_stdout, IOBuffer)
+        write(config.stdout, take!(temp_stdout))
+    end
+    if isa(temp_stderr, IOBuffer)
+        write(config.stderr, take!(temp_stderr))
+    end
+    return ret
 end
+run(exe::SandboxExecutor, config::SandboxConfig, user_cmd::Union{Cmd, Base.CmdRedirect}) = _run(run, exe, config, user_cmd)
+success(exe::SandboxExecutor, config::SandboxConfig, user_cmd::Union{Cmd, Base.CmdRedirect}) = _run(success, exe, config, user_cmd)
 
 """
     with_executor(f::Function, ::Type{<:SandboxExecutor} = preferred_executor(); kwargs...)
