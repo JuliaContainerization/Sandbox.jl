@@ -135,6 +135,10 @@ function check_overlayfs_loaded(;verbose::Bool = false)
     return true
 end
 
+function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConfig, user_cmd::Base.CmdRedirect)
+    return Base.CmdRedirect(build_executor_command(exe, config, user_cmd.cmd), user_cmd.handle, user_cmd.stream_no, user_cmd.readable)
+end
+
 function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConfig, user_cmd::Cmd)
     # While we would usually prefer to use the `executable_product()` function to get a
     # `Cmd` object that has all of the `PATH` and `LD_LIBRARY_PATH` environment variables

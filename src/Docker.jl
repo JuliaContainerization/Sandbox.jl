@@ -141,6 +141,13 @@ function commit_previous_run(exe::DockerExecutor, image_name::String)
     return image_name
 end
 
+function build_executor_command(exe::DockerExecutor, config::SandboxConfig, user_cmd::Base.CmdRedirect)
+    if user_cmd.stream_no > 2
+        error("DockerExecutor does not support redirection of streams other than stdin, stdout, and stderr")
+    end
+    return Base.CmdRedirect(build_executor_command(exe, confi, user_cmd.cmd), user_cmd.handle, user_cmd.stream_no, user_cmd.readable)
+end
+
 function build_executor_command(exe::DockerExecutor, config::SandboxConfig, user_cmd::Cmd)
     # Build the docker image that corresponds to this rootfs
     image_name = build_docker_image(config.mounts, config.uid, config.gid; verbose=config.verbose)
