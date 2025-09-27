@@ -68,9 +68,13 @@ function executor_available(::Type{T}; verbose::Bool=false) where {T <: UserName
         return false
     end
     return with_executor(T) do exe
-        return check_kernel_version(;verbose) &&
+        ret = check_kernel_version(;verbose) &&
                check_overlayfs_loaded(;verbose) &&
                probe_executor(exe; verbose)
+        if T == UnprivilegedUserNamespacesExecutor && !ret
+            check_restricted_unprivileged_userns()
+        end
+        return ret
     end
 end
 
@@ -248,4 +252,52 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
     end
 
     return sandbox_cmd
+end
+
+_userns_sysctl_props = ("apparmor_restrict_unprivileged_userns", "apparmor_restrict_unprivileged_unconfined")
+function check_restricted_unprivileged_userns()
+    if !Sys.islinux()
+        return
+    end
+
+    # Ubuntu 23.10 is slowly choking off our access to unprivileged user namespaces.
+    # In particular, they have made it so that `unconfined` isn't actually unconfined,
+    # and is unable to create unprivileged user namespaces.  This is super frustrating,
+    # because there's no way to launch a process using unpriv userns without needing
+    # superuser intervention (e.g. to create an apparmor profile).  Furthermore, it's
+    # annoying to even install one, as the path to our executable is unreliable, since
+    # it's in a content-addressed location.
+    #
+    # And so, I regret more and more every day that I don't just give up and reimplement
+    # everything on top of podman.  Until then, just ask the user to turn off these
+    # annoying protections:
+    if Sys.which("sysctl") !== nothing
+        failed_props = String[]
+        for prop in _userns_sysctl_props
+            if readchomp(`sysctl kernel.$(prop)`) == "kernel.$(prop) = 1"
+                push!(failed_props, prop)
+            end
+        end
+        if !isempty(failed_props)
+            @error("""
+            You have likely run into an issue due to over-zealous apparmor protections:
+            https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
+
+            To disable these protections, run: `Sandbox.disable_apparmor_userns_restrictions()`
+            This will require your sudo password.
+            """)
+        end
+    end
+end
+
+function disable_apparmor_userns_restrictions()
+    sysctl_commands = IOBuffer()
+    for prop in _userns_sysctl_props
+        println(sysctl_commands, "kernel.$(prop) = 0")
+    end
+    seekstart(sysctl_commands)
+    run(pipeline(`sudo tee /etc/sysctl.d/99-sandbox-unprivileged-user-namespaces.conf`, stdin=sysctl_commands, stdout=devnull))
+    for prop in _userns_sysctl_props
+        run(`sudo sysctl -w kernel.$(prop)=0`)
+    end
 end

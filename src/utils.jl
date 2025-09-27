@@ -15,14 +15,16 @@ function max_directory_ctime(prefix::String)
 end
 
 function get_mounts(;verbose::Bool = false)
+    mounts_file = "/proc/self/mounts"
     # Get a listing of the current mounts.  If we can't do this, just give up
-    if !isfile("/proc/mounts")
+    if !isfile(mounts_file)
         if verbose
-            @info("Couldn't open /proc/mounts, returning...")
+            @info("Couldn't open $(mounts_file), returning...")
         end
         return Tuple{String,SubString{String}}[]
     end
-    mounts = String(read("/proc/mounts"))
+    # We use `cat` here because for some reason, Julia v1.11 is truncating the file if we read directly.
+    mounts = String(read(`cat $(mounts_file)`))
 
     # Grab the fstype and the mountpoints
     mounts = [split(m)[2:3] for m in split(mounts, "\n") if !isempty(m)]
@@ -376,5 +378,6 @@ function find_persist_dir_root(rootfs_path::String, dir_hints::Vector{String} = 
     end
 
     # Not able to find a SINGLE persistent directory location that works!
+    check_restricted_unprivileged_userns()
     return (nothing, false)
 end
