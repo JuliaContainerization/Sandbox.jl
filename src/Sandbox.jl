@@ -120,7 +120,7 @@ for f in (:run, :success)
                 stdin=open_or_devnull(config.stdin),
                 stdout=temp_stdout,
                 stderr=temp_stderr,
-                )
+            )
             if config.verbose
                 @info("Running sandboxed command", user_cmd.exec)
             end
