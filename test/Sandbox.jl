@@ -41,6 +41,14 @@ for executor in all_executors
                 @test String(take!(stdout)) == "stdout\n"
                 @test String(take!(stderr)) == "stderr\n"
             end
+
+            # Test that we can run using the same exe and config multiple times:
+            with_executor(executor) do exe
+                @test success(exe, config, `/bin/sh -c "echo first"`)
+                @test String(take!(stdout)) == "first\n"
+                @test success(exe, config, `/bin/sh -c "echo second"`)
+                @test String(take!(stdout)) == "second\n"
+            end
         end
 
         @testset "ignorestatus()" begin
