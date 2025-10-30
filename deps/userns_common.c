@@ -299,7 +299,15 @@ void bind_mount(const char *src, const char *dest, char read_only) {
   // We don't expect workspaces to have any submounts in normal operation.
   // However, for runshell(), workspace could be an arbitrary directory,
   // including one with sub-mounts, so allow that situation with MS_REC.
-  check(0 == mount(resolved_src, dest, "", MS_BIND|MS_REC, NULL));
+  int mount_result = mount(resolved_src, dest, "", MS_BIND|MS_REC, NULL);
+  if (mount_result != 0 && errno == ENOENT) {
+    // Provide a more descriptive error for missing paths
+    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': %s (errno %d)\n",
+            resolved_src, dest, strerror(errno), errno);
+    fprintf(stderr, "  Please ensure that '%s' exists and is accessible.\n", resolved_src);
+    _exit(1);
+  }
+  check(mount_result == 0);
 
   // remount to read-only. this requires a separate remount:
   // https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git/commit/?id=9ac77b8a78452eab0612523d27fee52159f5016a
