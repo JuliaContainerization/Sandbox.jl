@@ -5,6 +5,31 @@ if Sys.islinux()
     @test Sandbox.check_kernel_version()
 end
 
+@testset "chmod_recursive with dangling/inaccessible symlinks" begin
+    mktempdir() do dir
+        # Create a directory tree similar to an overlay upper dir
+        tasks_dir = joinpath(dir, "upper", "rootfs", "tmp", "tasks")
+        mkpath(tasks_dir)
+
+        # Create a symlink pointing to an inaccessible path (simulates a
+        # symlink created inside a sandbox that points through /root/ which
+        # the host user cannot traverse after the sandbox exits)
+        symlink("/root/.claude/nonexistent/agent.jsonl", joinpath(tasks_dir, "abc1234.output"))
+
+        # Also create a regular file to ensure it's still processed
+        touch(joinpath(tasks_dir, "regular.txt"))
+        chmod(joinpath(tasks_dir, "regular.txt"), 0o000)
+
+        # This should not throw — previously it would because `isdir(path)`
+        # was checked before `islink(path)`, and `isdir` uses `stat()` which
+        # follows symlinks to the inaccessible target.
+        @test nothing === Sandbox.chmod_recursive(dir, 0o777, false)
+
+        # Verify the regular file got chmod'd
+        @test filemode(joinpath(tasks_dir, "regular.txt")) & 0o777 == 0o777
+    end
+end
+
 if executor_available(UnprivilegedUserNamespacesExecutor)
     @testset "UnprivilegedUserNamespacesExecutor" begin
         with_executor(UnprivilegedUserNamespacesExecutor) do exe
