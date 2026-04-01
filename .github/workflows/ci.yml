@@ -35,7 +35,7 @@ jobs:
         with:
           version: ${{ matrix.julia-version }}
           arch: ${{ matrix.julia-arch }}
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-runtest@v1
         env:
           SANDBOX_BUILD_LOCAL_SANDBOX: ${{ matrix.build-local-sandbox }}
@@ -52,7 +52,7 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: "^1.7.0-0"
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-docdeploy@releases/v1
         env:
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
