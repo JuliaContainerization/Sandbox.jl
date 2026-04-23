@@ -309,6 +309,11 @@ function find_persist_dir_root(rootfs_path::String, dir_hints::Vector{String} = 
             push!(probe_args, "--userxattr")
         end
 
+        # Guard against `realpath()` issues below
+        if !isdir(rootfs_path) || !isdir(mount_path)
+            return false
+        end
+
         return success(run(pipeline(ignorestatus(
             `$(probe_exe) $(probe_args) $(realpath(rootfs_path)) $(realpath(mount_path))`
         ); stdout = verbose ? stdout : devnull, stderr = verbose ? stderr : devnull)))
