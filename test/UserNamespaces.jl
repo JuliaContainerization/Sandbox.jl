@@ -103,6 +103,17 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
             @test String(take!(buf)) == "hello\n"
         end
     end
+
+    @testset "Non-existent dir_hints" begin
+        mktempdir() do dir
+            dir_hints = [
+                joinpath(dir, "non_existant"),
+                Sandbox.default_persist_root_dirs()...,
+            ]
+            persist_root, userxattr = Sandbox.find_persist_dir_root(Sandbox.debian_rootfs(), dir_hints)
+            @test persist_root != joinpath(dir, "non_existant")
+        end
+    end
 else
     @error("Skipping Unprivileged tests, as it does not seem to be available")
 end
