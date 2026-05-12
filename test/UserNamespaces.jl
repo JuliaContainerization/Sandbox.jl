@@ -31,6 +31,7 @@ end
 end
 
 if executor_available(UnprivilegedUserNamespacesExecutor)
+    rootfs_dir = Sandbox.debian_rootfs()
     @testset "UnprivilegedUserNamespacesExecutor" begin
         with_executor(UnprivilegedUserNamespacesExecutor) do exe
             @test probe_executor(exe)
@@ -38,7 +39,6 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
     end
     # Can run these tests only if we can actually mount tmpfs with unprivileged executor.
     @testset "Customize the tempfs size" begin
-        rootfs_dir = Sandbox.debian_rootfs()
         mounts = Dict(
             "/" => MountInfo(rootfs_dir, MountType.Overlayed),
         )
@@ -137,6 +137,51 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
             ]
             persist_root, userxattr = Sandbox.find_persist_dir_root(Sandbox.debian_rootfs(), dir_hints)
             @test persist_root != joinpath(dir, "non_existant")
+        end
+    end
+
+    @testset "mount ordering in executor commands" begin
+        # Test that mounts are properly ordered in the actual executor commands
+        # This ensures proper mounting order - parent directories before subdirectories
+        mktempdir() do test_dir
+            config = SandboxConfig(
+                Dict(
+                    "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                    "/usr" => MountInfo(test_dir, MountType.ReadOnly),
+                    "/usr/lib" => MountInfo(test_dir, MountType.ReadOnly),
+                    "/usr/lib/test" => MountInfo(test_dir, MountType.ReadWrite),
+                    "/etc" => MountInfo(test_dir, MountType.ReadOnly),
+                    "/etc/config" => MountInfo(test_dir, MountType.ReadWrite),
+                )
+            )
+
+            # Test UserNamespaces executor
+            exe = UnprivilegedUserNamespacesExecutor()
+            cmd = Sandbox.build_executor_command(exe, config, `/bin/true`)
+
+            # Extract the command arguments as strings
+            cmd_args = cmd.exec
+
+            # Find all --mount arguments
+            mount_args = String[]
+            for i in 1:length(cmd_args)-1
+                if cmd_args[i] == "--mount"
+                    push!(mount_args, cmd_args[i+1])
+                end
+            end
+
+            # Extract the sandbox paths from mount args (format: "host:sandbox:type")
+            mount_paths = String[]
+            for mount_arg in mount_args
+                parts = split(mount_arg, ":")
+                if length(parts) >= 2
+                    push!(mount_paths, parts[2])
+                end
+            end
+
+            # Verify that paths are ordered by length (longest first for UserNamespaces)
+            path_lengths = [length(path) for path in mount_paths]
+            @test issorted(path_lengths, rev=true)
         end
     end
 else
