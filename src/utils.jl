@@ -298,27 +298,49 @@ function default_persist_root_dirs()
     return dirs
 end
 
-function find_persist_dir_root(rootfs_path::String, dir_hints::Vector{String} = default_persist_root_dirs(); verbose::Bool = false)
-    function probe_overlay_mount(rootfs_path, mount_path; verbose::Bool = false, userxattr::Bool = false)
-        probe_exe = UserNSSandbox_jll.overlay_probe_path
-        probe_args = String[]
-        if verbose
-            push!(probe_args, "--verbose")
-        end
-        if userxattr
-            push!(probe_args, "--userxattr")
-        end
-
-        # Guard against `realpath()` issues below
-        if !isdir(rootfs_path) || !isdir(mount_path)
-            return false
-        end
-
-        return success(run(pipeline(ignorestatus(
-            `$(probe_exe) $(probe_args) $(realpath(rootfs_path)) $(realpath(mount_path))`
-        ); stdout = verbose ? stdout : devnull, stderr = verbose ? stderr : devnull)))
+function _probe_overlay_mount(rootfs_path::String, mount_path::String;
+                              verbose::Bool = false, userxattr::Bool = false,
+                              probe_exe = UserNSSandbox_jll.overlay_probe_path)
+    probe_args = String[]
+    if verbose
+        push!(probe_args, "--verbose")
+    end
+    if userxattr
+        push!(probe_args, "--userxattr")
     end
 
+    # Guard against `realpath()` issues below
+    if !isdir(rootfs_path) || !isdir(mount_path)
+        return false
+    end
+
+    probe_parent_dir = nothing
+    try
+        # userns_overlay_probe creates fixed paths below its parent directory.
+        # Give each probe attempt a private parent on the candidate filesystem so
+        # concurrent Julia processes do not collide while probing the same root.
+        probe_parent_dir = mktempdir(mount_path)
+        return success(run(pipeline(ignorestatus(
+            `$(probe_exe) $(probe_args) $(realpath(rootfs_path)) $(realpath(probe_parent_dir))`
+        ); stdout = verbose ? stdout : devnull, stderr = verbose ? stderr : devnull)))
+    catch e
+        if isa(e, Base.IOError)
+            return false
+        end
+        rethrow(e)
+    finally
+        if probe_parent_dir !== nothing
+            try
+                rm(probe_parent_dir; force=true, recursive=true)
+            catch e
+                @debug "Unable to clean up overlay probe directory" probe_parent_dir exception=(e, catch_backtrace())
+            end
+        end
+    end
+end
+
+function find_persist_dir_root(rootfs_path::String, dir_hints::Vector{String} = default_persist_root_dirs();
+                               verbose::Bool = false, probe_overlay_mount::Function = _probe_overlay_mount)
     # If one of our `dir_hints` works, use that, as those are typically our first
     # choices; things like a scratchspace, a user-supplied path, etc...
     for mount_path in dir_hints, userxattr in (true, false)
