@@ -5,6 +5,110 @@ if Sys.islinux()
     @test Sandbox.check_kernel_version()
 end
 
+@testset "AppArmor userns sysctl helpers" begin
+    props = Sandbox._userns_sysctl_props
+
+    mktempdir() do proc_sys
+        @test Sandbox._read_userns_sysctl(props[1]; proc_sys) === nothing
+        @test isempty(Sandbox._available_userns_sysctl_props(;
+            sysctl_exists = prop -> Sandbox._userns_sysctl_exists(prop; proc_sys),
+        ))
+
+        sysctl_path = Sandbox._userns_sysctl_path(props[1]; proc_sys)
+        mkpath(dirname(sysctl_path))
+        write(sysctl_path, "1\n")
+
+        @test Sandbox._userns_sysctl_exists(props[1]; proc_sys)
+        @test Sandbox._read_userns_sysctl(props[1]; proc_sys) == "1"
+        @test Sandbox._available_userns_sysctl_props(;
+            sysctl_exists = prop -> Sandbox._userns_sysctl_exists(prop; proc_sys),
+        ) == [props[1]]
+    end
+
+    values = Dict(props[1] => "1", props[2] => nothing)
+    @test Sandbox._restricted_userns_sysctl_props(; read_sysctl = prop -> get(values, prop, nothing)) == [props[1]]
+
+    values[props[1]] = "0"
+    values[props[2]] = "1"
+    @test Sandbox._restricted_userns_sysctl_props(; read_sysctl = prop -> get(values, prop, nothing)) == [props[2]]
+
+    empty!(values)
+    @test isempty(Sandbox._restricted_userns_sysctl_props(; read_sysctl = prop -> get(values, prop, nothing)))
+end
+
+if Sys.islinux()
+    @testset "concurrent persistence probes use unique work dirs" begin
+        mktempdir() do dir
+            rootfs = joinpath(dir, "rootfs")
+            candidate = joinpath(dir, "candidate")
+            probe_log = joinpath(dir, "probe.log")
+            probe_exe = joinpath(dir, "fake-overlay-probe")
+            mkpath(rootfs)
+            mkpath(candidate)
+            touch(probe_log)
+
+            write(probe_exe, """
+            #!/bin/sh
+            set -eu
+
+            while [ "\$#" -gt 0 ]; do
+                case "\$1" in
+                    --verbose|--userxattr|--tmpfs)
+                        shift
+                        ;;
+                    --uid|--gid)
+                        shift 2
+                        ;;
+                    --*)
+                        exit 2
+                        ;;
+                    *)
+                        break
+                        ;;
+                esac
+            done
+
+            rootfs="\$1"
+            probe_parent="\$2"
+            [ -d "\$rootfs" ]
+            [ -d "\$probe_parent" ]
+
+            marker="\$probe_parent/in-use"
+            mkdir "\$marker"
+            printf '%s\\n' "\$probe_parent" >> "$(probe_log)"
+            sleep 0.2
+            rmdir "\$marker"
+            """)
+            chmod(probe_exe, 0o755)
+
+            function probe_overlay_mount(rootfs_path, mount_path; verbose=false, userxattr=false)
+                return Sandbox._probe_overlay_mount(rootfs_path, mount_path; verbose, userxattr, probe_exe=probe_exe)
+            end
+
+            nprobes = 8
+            results = Vector{Any}(undef, nprobes)
+            @sync for idx in eachindex(results)
+                @async begin
+                    results[idx] = Sandbox.find_persist_dir_root(
+                        rootfs,
+                        [candidate];
+                        probe_overlay_mount,
+                    )
+                end
+            end
+
+            @test all(==((candidate, true)), results)
+
+            probe_parents = split(chomp(read(probe_log, String)), '\n')
+            @test length(probe_parents) == nprobes
+            @test length(unique(probe_parents)) == nprobes
+            @test all(parent -> dirname(parent) == realpath(candidate), probe_parents)
+            @test all(parent -> !ispath(parent), probe_parents)
+            @test isempty(readdir(candidate))
+        end
+    end
+end
+
 @testset "chmod_recursive with dangling/inaccessible symlinks" begin
     mktempdir() do dir
         # Create a directory tree similar to an overlay upper dir
