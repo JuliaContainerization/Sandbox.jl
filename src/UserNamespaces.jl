@@ -183,6 +183,7 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
     # set properly so that the executable product can be run, we are careful to ensure
     # that `sandbox` has no dependencies (as much as that is possible).
     cmd_string = String[UserNSSandbox_jll.sandbox_path, "--protocol", "3"]
+    isa(exe, PrivilegedUserNamespacesExecutor) && push!(cmd_string, "--privileged")
 
     # Enable verbose mode on the sandbox wrapper itself
     if config.verbose
