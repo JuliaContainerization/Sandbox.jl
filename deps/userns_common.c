@@ -382,7 +382,7 @@ void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid,
  */
 uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
                       const char * work_dir, uint8_t userxattr, unsigned long flags) {
-  char upper[PATH_MAX], work[PATH_MAX], opts[3*PATH_MAX+28];
+  char upper[PATH_MAX], work[PATH_MAX], opts[3*PATH_MAX+40];
 
   // Construct the location of our upper and work directories
   snprintf(upper, sizeof(upper), "%s/upper/%s", work_dir, bname);
@@ -411,7 +411,10 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   if (userxattr) {
     userxattr_opt = ",userxattr";
   }
-  snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s,workdir=%s%s", src, upper, work, userxattr_opt);
+  // Without the index, which the kernel may enable by default: with it, the upper layer
+  // only mounts again over the lower layer it was made with, while a read-only overlay
+  // of another directory is how the changes made through an overlay are looked at.
+  snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s,workdir=%s,index=off%s", src, upper, work, userxattr_opt);
   
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
   if (0 != mount("overlay", dest, "overlay", flags, opts)) {
