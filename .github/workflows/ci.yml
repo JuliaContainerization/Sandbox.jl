@@ -2,57 +2,77 @@ name: CI
 
 on:
   push:
-    branches: "main"
+    branches: [main]
     tags: ["*"]
   pull_request:
-  release:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Julia ${{ matrix.julia-version }} ${{ matrix.julia-arch }} build_local=${{ matrix.build-local-sandbox }}
-    runs-on: ubuntu-latest
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.sandbox }} sandbox
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      actions: write  # julia-actions/cache deletes old caches
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        julia-version:
-          - "1.7"
-          - "1"
-          - "nightly"
-        julia-arch:
-          - "x64"
-        build-local-sandbox:
-          - "true"
-          - "false"
-
+        version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
+        os: ['ubuntu-24.04', 'ubuntu-24.04-arm']
+        # `local` builds the sandbox from deps/, which is what pull requests change;
+        # `jll` uses the released UserNSSandbox_jll binaries that users get
+        sandbox: ['local']
+        include:
+          - version: '1'
+            os: 'ubuntu-24.04'
+            sandbox: 'jll'
+          - version: '1'
+            os: 'ubuntu-24.04-arm'
+            sandbox: 'jll'
     steps:
-      - name: Allow creation of user namespaces (e.g. to the unshare command)
-        run: |
-          # .. so that we don't get error:
-          # Idea from https://github.com/YoYoGames/GameMaker-Bugs/issues/6015#issuecomment-2135552784
-          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-      - uses: actions/checkout@v6
-      - uses: julia-actions/setup-julia@v2
+      # Ubuntu restricts unprivileged user namespaces through AppArmor
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
-          version: ${{ matrix.julia-version }}
-          arch: ${{ matrix.julia-arch }}
+          version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-runtest@v1
         env:
-          SANDBOX_BUILD_LOCAL_SANDBOX: ${{ matrix.build-local-sandbox }}
+          SANDBOX_BUILD_LOCAL_SANDBOX: ${{ matrix.sandbox == 'local' }}
+          SANDBOX_TEST_REQUIRE_EXECUTORS: true
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v6
+      - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
-  Documentation:
+  docs:
+    name: Documentation
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write  # Documenter pushes to gh-pages
+      pull-requests: read  # and checks that previews come from this repository
+      statuses: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
-          version: "^1.7.0-0"
+          version: '1'
       - uses: julia-actions/cache@v3
-      - uses: julia-actions/julia-docdeploy@releases/v1
+      - uses: julia-actions/julia-docdeploy@v1
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
