@@ -41,7 +41,6 @@
 #include <getopt.h>
 #include <byteswap.h>
 #include <poll.h>
-#include <ftw.h>
 
 /* BinaryBuilder's sysroots have C library and kernel headers older than the kernels we
    run on, so define what they lack. */
@@ -64,7 +63,6 @@
 /**** Global Variables ***/
 #define TRUE 1
 #define FALSE 0
-#define TRUEFALSE_EXITCODE(x) ((x) == TRUE ? 0 : 1)
 
 /* Exit codes that tell our own failures apart from the command's, as chosen by `env`,
    `chroot` and container runtimes: the sandbox could not be set up, or the command
@@ -82,8 +80,6 @@ void _check(int ok, const char * file, int line);
 #define check(ok) _check(ok, __FILE__, __LINE__)
 int open_proc_file(pid_t pid, const char *file, int mode);
 void mkpath(const char * dir);
-int isdir(const char * path);
-void rmrf(const char * path);
 
 /* Paths inside the sandbox */
 #define FD_PATH_SIZE 32
