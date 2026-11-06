@@ -19,11 +19,11 @@ if should_build_local_sandbox && UserNSSandbox_jll.is_available() &&
 end
 
 # Run a shell script in the sandbox, returning `(success, stdout, stderr)`.
-function sandbox_sh(executor, script; mounts=Dict{String,MountInfo}(), kwargs...)
+function sandbox_sh(executor, script; mounts=Dict{String,MountInfo}(), env=Dict{String,String}(), kwargs...)
     stdout, stderr = IOBuffer(), IOBuffer()
     config = SandboxConfig(
         Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
-        Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", env...);
         stdout, stderr, persist=false, kwargs...,
     )
     ok = with_executor(executor) do exe
@@ -36,6 +36,7 @@ host_cgroup2 = any(eachline("/proc/self/mounts")) do line
     fields = split(line)
     return fields[2] == "/sys/fs/cgroup" && fields[3] == "cgroup2"
 end
+host_sys_submounts = any(l -> startswith(split(l)[2], "/sys/"), eachline("/proc/self/mounts"))
 host_cgroup_dir() = "/sys/fs/cgroup" * replace(readline("/proc/self/cgroup"), r"^0::" => "")
 
 # A cgroup delegated to us, laid out like a job scheduler's: the scheduler in `sup/`, the
@@ -130,6 +131,51 @@ for executor in userns_executors
             # None of the sandbox's mounts is a peer or slave of a host mount
             ok, out, err = sandbox_sh(executor, "grep -cE ' (shared|master):' /proc/self/mountinfo")
             @test out == "0\n"
+        end
+
+        # SANDBOX_MOUNT_SETATTR=0 has the launcher do without mount_setattr(2), as on
+        # kernels before 5.12
+        @testset "read-only maps include their submounts (mount_setattr: $(setattr))" for setattr in ("1", "0")
+            env = Dict("SANDBOX_MOUNT_SETATTR" => setattr)
+            # mounts below `dir` that are not read-only
+            writable(dir) = "awk '(\$2 == \"$(dir)\" || \$2 ~ \"^$(dir)/\") && \$4 !~ /^ro(,|\$)/' /proc/self/mounts"
+            ok, out, err = sandbox_sh(executor, writable("/sys"); env)
+            @test ok
+            @test out == ""
+
+            if host_sys_submounts
+                ok, out, err = sandbox_sh(executor, """
+                    grep -c ' /hostsys/' /proc/self/mounts
+                    $(writable("/hostsys"))
+                    """; env, mounts=Dict("/hostsys" => MountInfo("/sys", MountType.ReadOnly)))
+                @test ok
+                @test parse(Int, readline(IOBuffer(out))) > 0
+                @test countlines(IOBuffer(out)) == 1
+            end
+
+            # Nested mounts at a path that /proc/self/mountinfo shows longer than
+            # PATH_MAX, as it escapes spaces (mounting them on the host takes root)
+            if PrivilegedUserNamespacesExecutor in userns_executors
+                mktempdir() do dir
+                    rel = joinpath(fill(" "^64, 20)...)
+                    outer = joinpath(dir, rel)
+                    inner = joinpath(outer, "inner")
+                    mkpath(outer)
+                    run(`sudo -n mount -t tmpfs -o mode=1777 none $(outer)`)
+                    try
+                        mkdir(inner)
+                        run(`sudo -n mount -t tmpfs -o mode=1777 none $(inner)`)
+                        for path in (joinpath("/m", rel, "x"), joinpath("/m", rel, "inner", "x"))
+                            ok, out, err = sandbox_sh(executor, "touch '$(path)'"; env,
+                                mounts=Dict("/m" => MountInfo(dir, MountType.ReadOnly)))
+                            @test !ok
+                            @test occursin("Read-only file system", err)
+                        end
+                    finally
+                        run(`sudo -n umount -R $(outer)`)
+                    end
+                end
+            end
         end
 
         @testset "private IPC namespace and /dev/shm" begin

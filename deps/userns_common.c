@@ -412,6 +412,218 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   return TRUE;
 }
 
+/**** Read-only mounts *****
+ *
+ * A bind mount made read-only by MS_REMOUNT|MS_RDONLY is read-only on its own; the mounts
+ * below it that came along with MS_REC stay writable.  mount_setattr(2) (Linux 5.12)
+ * changes a whole tree at once.  On older kernels, each mount of the tree is remounted
+ * read-only by itself, as listed in /proc/self/mountinfo.
+ */
+
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+#ifndef MS_NOSYMFOLLOW
+#define MS_NOSYMFOLLOW 256
+#endif
+#define SANDBOX_MOUNT_ATTR_RDONLY 0x00000001
+
+struct sandbox_mount_attr {
+  uint64_t attr_set;
+  uint64_t attr_clr;
+  uint64_t propagation;
+  uint64_t userns_fd;
+};
+
+/* The mount flags, as for MS_REMOUNT, in the per-mount options of /proc/self/mountinfo
+   (which are split up in place). */
+static unsigned long parse_mount_flags(char *options) {
+  unsigned long flags = 0;
+  int atime = 0;
+  for (char *save, *opt = strtok_r(options, ",", &save); opt != NULL; opt = strtok_r(NULL, ",", &save)) {
+    if (strcmp(opt, "ro") == 0)
+      flags |= MS_RDONLY;
+    else if (strcmp(opt, "nosuid") == 0)
+      flags |= MS_NOSUID;
+    else if (strcmp(opt, "nodev") == 0)
+      flags |= MS_NODEV;
+    else if (strcmp(opt, "noexec") == 0)
+      flags |= MS_NOEXEC;
+    else if (strcmp(opt, "nodiratime") == 0)
+      flags |= MS_NODIRATIME;
+    else if (strcmp(opt, "noatime") == 0)
+      flags |= MS_NOATIME, atime = 1;
+    else if (strcmp(opt, "relatime") == 0)
+      flags |= MS_RELATIME, atime = 1;
+    else if (strcmp(opt, "nosymfollow") == 0)
+      flags |= MS_NOSYMFOLLOW;
+  }
+  // mountinfo shows neither for strictatime, which the kernel would otherwise take
+  // to mean relatime.
+  if (!atime)
+    flags |= MS_STRICTATIME;
+  return flags;
+}
+
+/* Undoes the octal escapes (\040 etc.) of a mountinfo path, in place. */
+static void unescape_mountinfo(char *s) {
+  char *out = s;
+  for (; *s; s++) {
+    if (s[0] == '\\' && s[1] >= '0' && s[1] <= '3' && s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7') {
+      *out++ = (char)((s[1] - '0') << 6 | (s[2] - '0') << 3 | (s[3] - '0'));
+      s += 3;
+    } else {
+      *out++ = *s;
+    }
+  }
+  *out = '\0';
+}
+
+static int mount_id_of(int fd) {
+  char path[64], line[256];
+  snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+  FILE *f = fopen(path, "re");
+  check(f != NULL);
+  int id = -1;
+  while (fgets(line, sizeof(line), f)) {
+    if (sscanf(line, "mnt_id: %d", &id) == 1)
+      break;
+  }
+  fclose(f);
+  check(id != -1);
+  return id;
+}
+
+struct mountinfo_entry {
+  int id, parent, in_tree;
+  char *mount_point;
+  unsigned long flags;
+};
+
+/*
+ * Remounts read-only, by themselves, the mount at `fd` and every mount below it in
+ * /proc/self/mountinfo.  The submounts are looked up from `fd`, by their path below it.
+ */
+static void make_readonly_fallback(int fd, const char *dest) {
+  struct mountinfo_entry *entries = NULL;
+  size_t n_entries = 0, cap = 0;
+  char *line = NULL;
+  size_t line_cap = 0;
+  int target_id = mount_id_of(fd);
+
+  FILE *f = fopen("/proc/self/mountinfo", "re");
+  check(f != NULL);
+  while (getline(&line, &line_cap, f) != -1) {
+    // id parent major:minor root mount_point options ..., with spaces in paths escaped
+    char *fields[6], *save = NULL;
+    int n = 0;
+    for (char *tok = strtok_r(line, " \n", &save); tok != NULL && n < 6; tok = strtok_r(NULL, " \n", &save)) {
+      fields[n++] = tok;
+    }
+    check(n == 6);
+    if (n_entries == cap) {
+      cap = cap ? 2 * cap : 64;
+      entries = realloc(entries, cap * sizeof(*entries));
+      check(entries != NULL);
+    }
+    int id = atoi(fields[0]);
+    unescape_mountinfo(fields[4]);
+    entries[n_entries++] = (struct mountinfo_entry) {
+      .id = id, .parent = atoi(fields[1]), .in_tree = id == target_id,
+      .mount_point = strdup(fields[4]), .flags = parse_mount_flags(fields[5]),
+    };
+    check(entries[n_entries-1].mount_point != NULL);
+  }
+  check(!ferror(f));
+  free(line);
+  fclose(f);
+
+  // Mark the tree below the target.  mountinfo usually lists parents first, but
+  // not always (e.g. after MS_MOVE), so repeat until nothing changes.
+  const char *root = NULL;
+  for (int changed = 1; changed; ) {
+    changed = 0;
+    for (size_t i = 0; i < n_entries; i++) {
+      if (entries[i].id == target_id)
+        root = entries[i].mount_point;
+      if (entries[i].in_tree)
+        continue;
+      for (size_t j = 0; j < n_entries; j++) {
+        if (entries[j].in_tree && entries[j].id == entries[i].parent) {
+          entries[i].in_tree = changed = 1;
+          break;
+        }
+      }
+    }
+  }
+  check(root != NULL);
+  size_t root_len = strcmp(root, "/") == 0 ? 0 : strlen(root);
+
+  for (size_t i = 0; i < n_entries; i++) {
+    struct mountinfo_entry *e = &entries[i];
+    if (!e->in_tree)
+      continue;
+    char path[FD_PATH_SIZE];
+    int sub_fd;
+    if (e->id == target_id) {
+      sub_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    } else {
+      check(strncmp(e->mount_point, root, root_len) == 0 &&
+            (e->mount_point[root_len] == '/' || e->mount_point[root_len] == '\0'));
+      sub_fd = open_in_root(fd, e->mount_point + root_len, 0);
+      if (sub_fd == -1) {
+        // Below something we cannot look into, so out of the sandbox's reach as well.
+        check(errno == EACCES);
+        continue;
+      }
+      if (mount_id_of(sub_fd) != e->id) {
+        // Covered by another mount of the tree, which leaves no way to reach it.
+        close(sub_fd);
+        continue;
+      }
+    }
+    fd_path(path, sub_fd);
+    if (verbose) {
+      fprintf(stderr, "----> Remounting %s read-only\n", e->mount_point);
+    }
+    // Only add MS_RDONLY: the kernel refuses to clear the flags it locked on mounts
+    // that came from a more privileged mount namespace.
+    if (0 != mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|e->flags, NULL)) {
+      fprintf(stderr, "ERROR: Failed to make %s read-only (%s): %s (errno %d)\n",
+              dest, e->mount_point, strerror(errno), errno);
+      _exit(EXIT_SANDBOX_FAILED);
+    }
+    close(sub_fd);
+  }
+
+  for (size_t i = 0; i < n_entries; i++)
+    free(entries[i].mount_point);
+  free(entries);
+}
+
+/*
+ * Makes the mount at `fd`, and all mounts below it, read-only.  `dest` names it in
+ * messages.  SANDBOX_MOUNT_SETATTR=0 skips mount_setattr(2), so that the tests can
+ * exercise the fallback for older kernels.
+ */
+void make_readonly(int fd, const char *dest) {
+  const char *use_setattr = getenv("SANDBOX_MOUNT_SETATTR");
+  if (use_setattr == NULL || strcmp(use_setattr, "0") != 0) {
+    struct sandbox_mount_attr attr = { .attr_set = SANDBOX_MOUNT_ATTR_RDONLY };
+    if (0 == syscall(SYS_mount_setattr, fd, "", AT_EMPTY_PATH | AT_RECURSIVE, &attr, sizeof(attr)))
+      return;
+    if (errno != ENOSYS) {
+      fprintf(stderr, "ERROR: Failed to make %s read-only: %s (errno %d)\n",
+              dest, strerror(errno), errno);
+      _exit(EXIT_SANDBOX_FAILED);
+    }
+  }
+  make_readonly_fallback(fd, dest);
+}
+
 void mount_procfs(const char * root_dir, uid_t uid, gid_t gid) {
   char path[FD_PATH_SIZE];
 
@@ -475,57 +687,10 @@ void bind_mount(int root_fd, const char *src, const char *dest, char read_only) 
   close(dest_fd);
   close(src_fd);
 
-  // remount to read-only. this requires a separate remount:
-  // https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git/commit/?id=9ac77b8a78452eab0612523d27fee52159f5016a
-  // during such a remount, we're not allowed to clear locked mount flags:
-  // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=9566d6742852c527bf5af38af5cbb878dad75705
   if (read_only) {
-    // we cannot apply locked mount flags blindly, because they change behaviour of the
-    // mount (e.g. noexec), so figure out which ones we need by looking at mtab.
-    struct mntent *mnt = NULL;
-    FILE * mtab = setmntent("/proc/self/mounts", "r");
-    check(mtab != NULL);
-    while (mnt = getmntent(mtab)) {
-        struct stat dev_stat;
-        // It's possible that we try to stat() something that we're
-        // not allowed to look at; if that occurs, skip it, hoping
-        // that it's not the mount we're actually interested in.
-        if (stat(mnt->mnt_dir, &dev_stat) == 0 &&
-            dev_stat.st_dev == src_stat.st_dev)
-            break;
-
-        // Don't let a non-matching `mnt` leak through, in the event
-        // that we never find the device the mount belongs to.
-        mnt = NULL;
-    }
-    endmntent(mtab);
-
-    // This will fail if we never found the matching `mnt`.
-    check(mnt != NULL);
-
-    int locked_flags = 0;
-    char *mnt_opt;
-    mnt_opt = strtok(mnt->mnt_opts, ",");
-    while (mnt_opt != NULL) {
-        if (strcmp(mnt_opt, "nodev") == 0)
-            locked_flags |= MS_NODEV;
-        else if (strcmp(mnt_opt, "nosuid") == 0)
-            locked_flags |= MS_NOSUID;
-        else if (strcmp(mnt_opt, "noexec") == 0)
-            locked_flags |= MS_NOEXEC;
-        else if (strcmp(mnt_opt, "noatime") == 0)
-            locked_flags |= MS_NOATIME;
-        else if (strcmp(mnt_opt, "nodiratime") == 0)
-            locked_flags |= MS_NODIRATIME;
-        else if (strcmp(mnt_opt, "relatime") == 0)
-            locked_flags |= MS_RELATIME;
-        mnt_opt = strtok(NULL, ",");
-    }
-
     // The new mount is on top of the mount point, so look it up again.
     dest_fd = open_in_root_or_die(root_fd, dest, 0);
-    fd_path(dest_path, dest_fd);
-    check(0 == mount(NULL, dest_path, "", MS_BIND|MS_REMOUNT|MS_RDONLY|locked_flags, NULL));
+    make_readonly(dest_fd, dest);
     close(dest_fd);
   }
 }
