@@ -222,6 +222,26 @@ for mode in launcher_modes
                 run(mode == :sudo ? `sudo -n rm -rf $(dir)/persist $(dir)/other` : `chmod -R u+rwX $(dir)`)
             end
 
+            # One sandbox at a time per persist directory
+            mktempdir() do dir
+                persist = joinpath(dir, "persist")
+                rootfs = Sandbox.debian_rootfs()
+                first = launcher_cmd(mode, `--protocol 3 --rootfs $(rootfs) --persist $(persist) -- /bin/sh -c 'echo up; read x; true'`)
+                p = open(first, "r+")
+                try
+                    @test readline(p) == "up"
+                    code, out, err = launch(mode, ``; options=`--persist $(persist)`)
+                    @test code == 125
+                    @test occursin("in use by another sandbox", err)
+                finally
+                    close(p.in)
+                    wait(p)
+                end
+                @test success(p)
+                @test launch(mode, ``; options=`--persist $(persist)`)[1] == 0
+                run(mode == :sudo ? `sudo -n rm -rf $(persist)` : `chmod -R u+rwX $(persist)`)
+            end
+
             # Overlays at different places keep their changes apart.  These two
             # destinations had the same 32-bit hash in the name of their state.
             mktempdir() do dir
