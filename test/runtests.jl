@@ -66,7 +66,6 @@ end
 include("SandboxConfig.jl")
 include("UserNamespaces.jl")
 include("Launcher.jl")
-include("Docker.jl")
 include("Sandbox.jl")
 
 if Sys.islinux()

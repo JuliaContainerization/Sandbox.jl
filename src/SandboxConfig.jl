@@ -61,8 +61,7 @@ Sandbox executors require a configuration to set up the environment properly.
   `false` (user namespace executors only), e.g. `"2G"`.
 
 - `shm_size`: Size of the sandbox's private `/dev/shm`, e.g. `"1G"`.
-  - Defaults to `nothing`, which leaves it at the executor's default (half of the
-    memory for the user namespace executors, 64 MB for Docker).
+  - Defaults to `nothing`, which leaves it at half of the memory.
 
 - `verbose`: Set whether the sandbox construction process should be more or less verbose.
 """

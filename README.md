@@ -16,12 +16,8 @@
 
 > The cultured host's toolkit for ill-mannered Linux guests.
 
-This package provides basic containerization tools for running Linux guests on a variety of platforms.
-As of the time of writing, it supports two execution backends:
-
-* A Linux User Namespaces executor, which is very fast and lightweight
-
-* A [Docker](https://www.docker.com/) (or [Podman](https://podman.io/)) executor which is slower, but more compatible (it works on macOS, and may work on Windows)
+This package provides basic containerization tools for running Linux guests on Linux hosts,
+with user namespaces.
 
 The executors are responsible for running/virtualizing a given `Cmd` within a root filesystem that is defined by the user, along with various paths that can be mounted within the sandbox.
 These capabilities were originally built for [BinaryBuilder.jl](https://github.com/JuliaPackaging/BinaryBuilder.jl), however this functionality is now mature enough that it may be useful elsewhere.
@@ -75,7 +71,7 @@ the host's network.  Inside it:
 
 ## Getting more rootfs images
 
-To use more interesting rootfs images, you can either create your own using tools such as [`debootstrap`](https://wiki.debian.org/Debootstrap) or you can pull one from docker by using the `pull_docker_image()` function defined within this package.  See the [`contrib`](contrib/) directory for examples of both.
+To use more interesting rootfs images, you can either create your own using tools such as [`debootstrap`](https://wiki.debian.org/Debootstrap) or you can export one from a docker image.  See the [`contrib`](contrib/) directory for examples of both.
 
 You can also check out the latest releases of the [`JuliaCI/rootfs-images` repository](https://github.com/JuliaCI/rootfs-images/), which curates a collection of rootfs images for use in CI workloads.
 
