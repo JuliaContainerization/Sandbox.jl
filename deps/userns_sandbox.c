@@ -31,6 +31,7 @@
 #include "userns_common.h"
 #include <grp.h>
 #include <stdarg.h>
+#include <sys/file.h>
 
 enum op_type {
   OP_BIND,
@@ -86,7 +87,8 @@ static void print_help() {
     "\n"
     "Options:\n"
     "  --rootfs DIR              the root of the sandbox (required)\n"
-    "  --persist DIR             keep the changes to the rootfs and overlays in DIR\n"
+    "  --persist DIR             keep the changes to the rootfs and overlays in DIR,\n"
+    "                            which only one sandbox at a time may use\n"
     "  --tmpfs-size SIZE         size of the tmpfs that holds the changes without --persist\n"
     "  --uid UID, --gid GID      the sandbox's user and group (default 0)\n"
     "  --hostname NAME           the sandbox's hostname\n"
@@ -903,6 +905,21 @@ int main(int sandbox_argc, char **sandbox_argv) {
   // nested sandboxen; that would cause problems when we refer to UIDs that don't exist.
   unsetenv("SUDO_UID");
   unsetenv("SUDO_GID");
+
+  // overlayfs doesn't support an upper layer that is mounted twice, so only one sandbox
+  // at a time may use a persist directory.  The lock is held by the launcher's processes
+  // and the sandbox's init, which outlive the sandbox's mounts, but not by the command:
+  // the fd is close-on-exec.
+  if (persist_dir != NULL) {
+    mkpath(persist_dir);
+    int lock_fd = open(persist_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(lock_fd != -1);
+    if (0 != flock(lock_fd, LOCK_EX | LOCK_NB)) {
+      check(errno == EWOULDBLOCK);
+      fprintf(stderr, "ERROR: The persist directory '%s' is in use by another sandbox\n", persist_dir);
+      return EXIT_SANDBOX_FAILED;
+    }
+  }
 
   // If we're running in one of the container modes, we're going to syscall() ourselves a
   // new, cloned process that is in a container process. We will use a pipe for synchronization.
