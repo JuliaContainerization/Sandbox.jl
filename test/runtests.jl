@@ -41,6 +41,21 @@ if Sandbox.getuid() == 0
     @warn("You are running Sandbox.jl tests as root!  This cannot test unprivileged namespaces!")
 end
 
+# The executor test sets skip executors that aren't available. Where all of them should
+# work (e.g. our CI), fail instead, so that a broken setup can't fall back unnoticed.
+if parse(Bool, get(ENV, "SANDBOX_TEST_REQUIRE_EXECUTORS", "false"))
+    @testset "required executors" begin
+        @testset "$executor" for executor in Sandbox.all_executors
+            available = executor_available(executor)
+            if !available
+                # rerun verbosely to show why
+                executor_available(executor; verbose=true)
+            end
+            @test available
+        end
+    end
+end
+
 include("aqua.jl")
 include("SandboxConfig.jl")
 include("UserNamespaces.jl")
