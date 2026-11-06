@@ -73,7 +73,7 @@ enum {
 };
 static int execution_mode;
 
-// Whether we should mount our overlay with the `userxattr` option
+// Whether the overlays have the `userxattr` option; see `mount_persisted_root()`.
 static int userxattr = 0;
 
 // Device nodes and setuid/setgid bits in the image must not take effect.  Mounts made
@@ -91,7 +91,6 @@ static void print_help() {
     "Options:\n"
     "  --rootfs DIR              the root of the sandbox (required)\n"
     "  --persist DIR             keep the changes to the rootfs and overlays in DIR\n"
-    "  --userxattr               mount the overlays with the userxattr option\n"
     "  --tmpfs-size SIZE         size of the tmpfs that holds the changes without --persist\n"
     "  --uid UID, --gid GID      the sandbox's user and group (default 0)\n"
     "  --hostname NAME           the sandbox's hostname\n"
@@ -234,8 +233,6 @@ static int parse_args(int argc, char **argv, const char **uid_arg, const char **
       break;
     } else if (strcmp(opt, "--verbose") == 0) {
       verbose = 1;
-    } else if (strcmp(opt, "--userxattr") == 0) {
-      userxattr = 1;
     } else if (strcmp(opt, "--rootfs") == 0) {
       set_once(&sandbox_root, &i, argc, argv);
     } else if (strcmp(opt, "--persist") == 0) {
@@ -522,6 +519,75 @@ static void mount_proc(int root_fd) {
   close(fd);
 }
 
+static int in_initial_user_namespace() {
+  char map[64] = {0};
+  unsigned int inside, outside, count;
+  int fd = open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC);
+  check(fd != -1);
+  check(read(fd, map, sizeof(map) - 1) > 0);
+  close(fd);
+  return sscanf(map, "%u %u %u", &inside, &outside, &count) == 3 &&
+         inside == 0 && outside == 0 && count == 4294967295u;
+}
+
+/*
+ * Mounts the rootfs overlay, with its changes in `work_dir`, the persist directory.
+ *
+ * overlayfs records what it needs (whiteouts of directories, renames) in extended
+ * attributes.  It uses trusted.overlay.*, which only real root can set, unless it is
+ * mounted with `userxattr` (Linux 5.11), for user.overlay.*.  In a user namespace that is
+ * the only way to get them, and it works for root as well, so it comes first.  The
+ * changes kept in the persist directory can only be read the way they were written, so
+ * that is recorded there, in `xattrs`: "user", "trusted" (by real root), or
+ * "trusted-userns" (in a user namespace, on kernels that patch overlayfs in before 5.11).
+ * Once recorded, a failure to mount must not lead to another way.
+ */
+static void mount_persisted_root(const char *lower_dir, const char *work_dir) {
+  char marker[PATH_MAX], upper[PATH_MAX], recorded[32] = {0};
+  const char *trusted = in_initial_user_namespace() ? "trusted\n" : "trusted-userns\n";
+  int n = snprintf(marker, sizeof(marker), "%s/xattrs", work_dir);
+  check(0 < n && n < sizeof(marker));
+  n = snprintf(upper, sizeof(upper), "%s/upper", work_dir);
+  check(0 < n && n < sizeof(upper));
+  int fd = open(marker, O_RDONLY | O_CLOEXEC);
+  if (fd == -1) {
+    check(errno == ENOENT);
+    if (access(upper, F_OK) == 0) {
+      fprintf(stderr, "ERROR: The changes in '%s' don't say how they were made (no `xattrs`)\n", persist_dir);
+      _exit(EXIT_SANDBOX_FAILED);
+    }
+    userxattr = 1;
+    if (TRUE != mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, 1, overlay_flags)) {
+      check(errno == EINVAL);
+      if (verbose) {
+        fprintf(stderr, "--> The kernel doesn't take userxattr, mounting without it\n");
+      }
+      userxattr = 0;
+      check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, 0, overlay_flags));
+    }
+    fd = open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    check(fd != -1);
+    const char *value = userxattr ? "user\n" : trusted;
+    check(write(fd, value, strlen(value)) == strlen(value));
+    close(fd);
+    return;
+  }
+  check(read(fd, recorded, sizeof(recorded) - 1) >= 0);
+  close(fd);
+  if (strcmp(recorded, "user\n") == 0) {
+    userxattr = 1;
+  } else if (strcmp(recorded, trusted) == 0) {
+    userxattr = 0;
+  } else {
+    fprintf(stderr, "ERROR: The changes in '%s' were made %s, and this sandbox can't read them\n",
+            persist_dir, strcmp(recorded, "trusted\n") == 0 ? "by real root without userxattr" :
+                         strcmp(recorded, "trusted-userns\n") == 0 ? "in a user namespace without userxattr"
+                                                                   : "in an unknown way (see its `xattrs`)");
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+  check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, userxattr, overlay_flags));
+}
+
 /*
  * Mounts the rootfs, /proc, and everything the operations ask for, in the mount namespace
  * of the sandbox: in privileged mode, before we clone the sandbox's user namespace, and
@@ -551,7 +617,6 @@ static void mount_the_world(uid_t uid, gid_t gid) {
   char lower_path[FD_PATH_SIZE], scratch_path[FD_PATH_SIZE];
   int lower_fd = -1, scratch_fd = -1;
   if (persist_dir == NULL) {
-    userxattr = 0;
     lower_fd = open_root(sandbox_root);
     fd_path(lower_path, lower_fd);
     lower_dir = lower_path;
@@ -572,7 +637,13 @@ static void mount_the_world(uid_t uid, gid_t gid) {
   if (verbose) {
     fprintf(stderr, "--> Creating overlay workdir at %s\n", work_dir);
   }
-  check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, userxattr, overlay_flags));
+  if (persist_dir == NULL) {
+    // tmpfs has user xattrs only since Linux 6.6.  Without them, and without root, the
+    // overlays get by without xattrs, which matters less for changes thrown away.
+    check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, 0, overlay_flags));
+  } else {
+    mount_persisted_root(lower_dir, work_dir);
+  }
   int root_fd = open_root(sandbox_root);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
