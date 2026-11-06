@@ -57,6 +57,12 @@ if parse(Bool, get(ENV, "SANDBOX_TEST_REQUIRE_EXECUTORS", "false"))
 end
 
 include("aqua.jl")
+# captured variables that get boxed (`Core.Box`) lose their type
+if isdefined(Test, :detect_closure_boxes)
+    @testset "closure boxes" begin
+        @test Test.detect_closure_boxes(Sandbox) == []
+    end
+end
 include("SandboxConfig.jl")
 include("UserNamespaces.jl")
 include("Docker.jl")

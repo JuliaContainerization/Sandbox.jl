@@ -75,34 +75,32 @@ to make that decision.
 """
 function is_ecryptfs(path::AbstractString; verbose::Bool=false)
     # Canonicalize `path` immediately, and if it's a directory, add a "/" so
-    # as to be consistent with the rest of this function
-    path = abspath(path)
-    if isdir(path)
-        path = abspath(path * "/")
-    end
+    # as to be consistent with the rest of this function. This is a new variable
+    # because reassigning `path` would box it in the closures below.
+    abs_path = isdir(path) ? abspath(path * "/") : abspath(path)
 
     if verbose
-        @info("Checking to see if $path is encrypted...")
+        @info("Checking to see if $abs_path is encrypted...")
     end
 
     # Get a listing of the current mounts.  If we can't do this, just give up
     mounts = get_mounts()
     if isempty(mounts)
-        return false, path
+        return false, abs_path
     end
 
     # Fast-path asking for a mountpoint directly (e.g. not a subdirectory)
-    direct_path = [m[1] == path for m in mounts]
+    direct_path = [m[1] == abs_path for m in mounts]
     local parent
     if any(direct_path)
         parent = mounts[findfirst(direct_path)]
     else
         # Find the longest prefix mount:
-        parent_mounts = [m for m in mounts if startswith(path, m[1])]
+        parent_mounts = [m for m in mounts if startswith(abs_path, m[1])]
         if isempty(parent_mounts)
             # This is weird; this means that we can't find any mountpoints that
             # hold the given path.  I've only ever seen this in `chroot`'ed scenarios.
-            return false, path
+            return false, abs_path
         end
         parent = parent_mounts[argmax(map(m->length(m[1]), parent_mounts))]
     end
@@ -110,7 +108,7 @@ function is_ecryptfs(path::AbstractString; verbose::Bool=false)
     # Return true if this mountpoint is an ecryptfs mount
     val = parent[2] == "ecryptfs"
     if verbose && val
-        @info("  -> $path is encrypted from mountpoint $(parent[1])")
+        @info("  -> $abs_path is encrypted from mountpoint $(parent[1])")
     end
     return val, parent[1]
 end
