@@ -215,6 +215,10 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
         append!(cmd_string, ["--tmpfs-size", config.tmpfs_size])
     end
 
+    if config.shm_size !== nothing
+        append!(cmd_string, ["--shm-size", config.shm_size])
+    end
+
     if config.hostname !== nothing
         append!(cmd_string, ["--hostname", config.hostname])
     end

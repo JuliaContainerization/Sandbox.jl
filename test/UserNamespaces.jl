@@ -257,6 +257,15 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
         end
     end
 
+    @testset "optional flags in executor commands" begin
+        exe = UnprivilegedUserNamespacesExecutor()
+        config = SandboxConfig(Dict("/" => rootfs_dir); persist=false)
+        @test "--shm-size" ∉ Sandbox.build_executor_command(exe, config, `/bin/true`).exec
+        config = SandboxConfig(Dict("/" => rootfs_dir); persist=false, shm_size="64M")
+        args = Sandbox.build_executor_command(exe, config, `/bin/true`).exec
+        @test args[findfirst(==("--shm-size"), args) + 1] == "64M"
+    end
+
     @testset "mount ordering in executor commands" begin
         # Test that mounts are properly ordered in the actual executor commands
         # This ensures proper mounting order - parent directories before subdirectories

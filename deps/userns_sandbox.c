@@ -77,7 +77,8 @@ static int userxattr = 0;
 /*
  * We use this method to get /dev in shape.  If we're running as init, we need to
  * mount full-blown devtmpfs at /dev.  If we're just a sandbox, we only bindmount
- * /dev/{tty,null,urandom,pts,ptmx} into our root_dir.
+ * /dev/{tty,null,urandom,pts,ptmx} into our root_dir.  /dev/shm is not the host's:
+ * `mount_private()` mounts a fresh one from within the sandbox's IPC namespace.
  */
 static void mount_dev(const char * root_dir) {
   char path[PATH_MAX];
@@ -89,7 +90,10 @@ static void mount_dev(const char * root_dir) {
   bind_host_node(root_dir, "/dev/zero", FALSE);
   bind_host_node(root_dir, "/dev/random", FALSE);
   bind_host_node(root_dir, "/dev/urandom", FALSE);
-  bind_host_node(root_dir, "/dev/shm", FALSE);
+
+  // Create the mount point for `mount_private()`, which runs in the cloned child.
+  snprintf(path, sizeof(path), "%s/dev/shm", root_dir);
+  mkpath(path);
 
   // Bindmount the sysfs, but make it read-only
   bind_host_node(root_dir, "/sys", TRUE);
@@ -204,6 +208,30 @@ static void mount_the_world(const char * root_dir,
 }
 
 /*
+ * Mounts that belong to the namespaces of the cloned child rather than to the host,
+ * so they are made after `clone()` in both execution modes:
+ *   - a fresh tmpfs on /dev/shm, private to the sandbox like its IPC namespace;
+ *     its pages are charged to the memory cgroup of the processes that use them.
+ */
+static void mount_private(const char * root_dir, const char * shm_size) {
+  char path[PATH_MAX];
+  char options[64];
+  int n;
+
+  snprintf(path, sizeof(path), "%s/dev/shm", root_dir);
+  if (shm_size != NULL) {
+    n = snprintf(options, sizeof(options), "mode=1777,size=%s", shm_size);
+  } else {
+    n = snprintf(options, sizeof(options), "mode=1777");
+  }
+  check(0 < n && n < sizeof(options));
+  if (verbose) {
+    fprintf(stderr, "--> Mounting tmpfs at %s (%s)\n", path, options);
+  }
+  check(0 == mount("tmpfs", path, "tmpfs", MS_NOSUID|MS_NODEV, options));
+}
+
+/*
  * Sets up the chroot jail, then executes the target executable.
  */
 static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_argc, char **sandbox_argv, int *parent_pipe) {
@@ -308,6 +336,7 @@ static void print_help() {
   fputs("[--persist <work_dir>] ", stderr);
   fputs("[--entrypoint <exe_path>] ", stderr);
   fputs("[--userxattr] ", stderr);
+  fputs("[--shm-size <size>] ", stderr);
   fputs("[--verbose] [--help] <cmd>\n", stderr);
   fputs("\nExample:\n", stderr);
   fputs("  mkdir -p /tmp/workspace\n", stderr);
@@ -369,6 +398,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
   gid_t dst_gid = 0;
 
   char * tmpfs_size = "1G"; // default value if the `--tmpfs-size` option is not provided
+  char * shm_size = NULL;   // size of /dev/shm; the tmpfs default (half of RAM) if not given
 
   // Parse out options
   while(1) {
@@ -383,6 +413,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
       {"uid",        required_argument, NULL, 'u'},
       {"gid",        required_argument, NULL, 'g'},
       {"tmpfs-size", required_argument, NULL, 't'},
+      {"shm-size",   required_argument, NULL, 's'},
       {"userxattr",  no_argument,       NULL, 'x'},
       {"hostname",   required_argument, NULL, 'H'},
       {0, 0, 0, 0}
@@ -509,6 +540,12 @@ int main(int sandbox_argc, char **sandbox_argv) {
           fprintf(stderr, "Parsed --tmpfs-size as \"%s\"\n", tmpfs_size);
         }
         break;
+      case 's':
+        shm_size = strdup(optarg);
+        if (verbose) {
+          fprintf(stderr, "Parsed --shm-size as \"%s\"\n", shm_size);
+        }
+        break;
       case 'H':
         hostname = strdup(optarg);
         if (verbose) {
@@ -575,8 +612,9 @@ int main(int sandbox_argc, char **sandbox_argv) {
     mount_the_world(sandbox_root, mounts, uid, gid, persist_dir, tmpfs_size);
   }
 
-  // We want to request a new PID space, a new mount space, and a new user space
-  int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | SIGCHLD;
+  // We want to request a new PID space, a new mount space, a new user space, and
+  // private hostname and IPC namespaces.
+  int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWIPC | SIGCHLD;
   if ((child_pid = syscall(SYS_clone, clone_flags, 0, 0, 0, 0)) == 0) {
     // If we're in here, we have become the "child" process, within the container.
 
@@ -612,6 +650,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
       // have supreme cosmic power.
       mount_the_world(sandbox_root, mounts, dst_uid, dst_gid, persist_dir, tmpfs_size);
     }
+    mount_private(sandbox_root, shm_size);
 
     // Set the hostname, if that's been requested
     if (hostname != NULL) {

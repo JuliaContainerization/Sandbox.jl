@@ -44,5 +44,35 @@ for executor in userns_executors
                 @test isempty(err)
             end
         end
+
+        @testset "private IPC namespace and /dev/shm" begin
+            # A marker in the host's /dev/shm must not be visible inside
+            marker = "sandbox-isolation-test-$(getpid())"
+            host_shm = isdir("/dev/shm") ? joinpath("/dev/shm", marker) : nothing
+            host_shm === nothing || touch(host_shm)
+            try
+                ok, out, err = sandbox_sh(executor, """
+                    readlink /proc/self/ns/ipc
+                    stat -f -c %T /dev/shm
+                    stat -c %a /dev/shm
+                    ls -A /dev/shm
+                    """)
+                @test ok
+                lines = split(out, '\n')
+                @test lines[1] != readlink("/proc/self/ns/ipc")
+                @test lines[2] == "tmpfs"
+                @test lines[3] == "1777"
+                @test lines[4] == ""
+            finally
+                host_shm === nothing || rm(host_shm; force=true)
+            end
+
+            # The size of /dev/shm can be limited
+            script = "dd if=/dev/zero of=/dev/shm/blob bs=1M count=16"
+            @test sandbox_sh(executor, script; shm_size="32M")[1]
+            ok, out, err = sandbox_sh(executor, script; shm_size="8M")
+            @test !ok
+            @test occursin("No space left on device", err)
+        end
     end
 end
