@@ -74,6 +74,7 @@ extern pid_t child_pid;
 
 
 /* General utilities */
+pid_t raw_fork(void);
 void _check(int ok, const char * file, int line);
 #define check(ok) _check(ok, __FILE__, __LINE__)
 int open_proc_file(pid_t pid, const char *file, int mode);
