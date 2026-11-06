@@ -41,6 +41,7 @@
 #include <getopt.h>
 #include <byteswap.h>
 #include <mntent.h>
+#include <poll.h>
 #include <ftw.h>
 
 #ifndef CGROUP2_SUPER_MAGIC

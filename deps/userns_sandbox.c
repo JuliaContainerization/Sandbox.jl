@@ -311,6 +311,21 @@ static void lock_sandbox() {
 }
 
 /*
+ * Makes the kernel SIGKILL us when the launcher dies.  We are the init of the outermost
+ * PID namespace, so that takes all the sandboxed processes with us.  `status_fd` is our
+ * end of the status pipe, which tells us whether the launcher already died before that:
+ * `getppid()` can't, as the launcher is outside our PID namespace.
+ */
+static void die_with_launcher(int status_fd) {
+  check(0 == prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0));
+  struct pollfd pfd = {.fd = status_fd, .events = 0};
+  check(0 <= poll(&pfd, 1, 0));
+  if (pfd.revents & POLLERR) {
+    _exit(1);
+  }
+}
+
+/*
  * Sets up the chroot jail, then executes the target executable.
  */
 static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_argc, char **sandbox_argv, int *parent_pipe) {
@@ -723,6 +738,8 @@ int main(int sandbox_argc, char **sandbox_argv) {
     close(child_pipe[1]);
     close(parent_pipe[0]);
 
+    die_with_launcher(parent_pipe[1]);
+
     // N.B: Capabilities in the original user namespaces are now dropped
     // The kernel may have decided to reset our dumpability, because of
     // the privilege change. However, the parent needs to access our /proc
@@ -743,6 +760,8 @@ int main(int sandbox_argc, char **sandbox_argv) {
       // the requested uid/gids (defaulting to zero) within this container.
       check(0 == setuid(dst_uid));
       check(0 == setgid(dst_gid));
+      // Changing credentials disarmed the death signal.
+      die_with_launcher(parent_pipe[1]);
 
       // The /proc mountpoint previously mounted is in the wrong PID namespace;
       // mount a new procfs over it to to get better values:
