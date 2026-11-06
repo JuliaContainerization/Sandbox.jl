@@ -228,10 +228,16 @@ function register_requested_formats!(formats::Vector{BinFmtRegistration}; verbos
     formats_to_register = BinFmtRegistration[]
     for reg in formats
         if !any(formats_match.(Ref(reg), regs))
+            # This artifact contains the necessary QEMU executable (for the current host
+            # architecture). Older QEMU builds, which we still use for 64-bit guests on
+            # 32-bit hosts, name it with a `-static` suffix.
+            interpreter = joinpath(@artifact_str(reg.name), reg.name)
+            if !isfile(interpreter)
+                interpreter *= "-static"
+            end
             push!(formats_to_register, BinFmtRegistration(
                 reg.name,
-                # This artifact contains the necessary QEMU executable (for the current host architecture)
-                @artifact_str("$(reg.name)/$(reg.name)-static"),
+                interpreter,
                 reg.flags,
                 reg.offset,
                 reg.magic,
