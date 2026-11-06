@@ -1,33 +1,13 @@
 using Test, Sandbox
 
-# Where an executor can run, a sandbox that fails to start must fail the tests rather
-# than drop the executor from them, so only the host's support is checked up front.
-userns_executors = Type{<:UserNamespacesExecutor}[]
-if UserNSSandbox_jll.is_available() &&
-   Sandbox.check_kernel_version() && Sandbox.check_overlayfs_loaded()
-    if Sandbox.getuid() != 0
-        push!(userns_executors, UnprivilegedUserNamespacesExecutor)
-    end
-    if Sys.which("sudo") !== nothing && success(`sudo -k -n true`)
-        push!(userns_executors, PrivilegedUserNamespacesExecutor)
-    end
-    for executor in userns_executors
-        @test executor_available(executor)
-    end
-end
+using Sandbox: command
 
 # Run a shell script in the sandbox, returning `(success, stdout, stderr)`.
-function sandbox_sh(executor, script; mounts=Dict{String,MountInfo}(), env=Dict{String,String}(), kwargs...)
-    stdout, stderr = IOBuffer(), IOBuffer()
-    config = SandboxConfig(
-        Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
-        Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", env...);
-        stdout, stderr, persist=false, kwargs...,
-    )
-    ok = with_executor(executor) do exe
-        success(exe, config, ignorestatus(`/bin/sh -c $(script)`))
-    end
-    return ok, String(take!(stdout)), String(take!(stderr))
+function sandbox_sh(mode, script; mounts=Pair{String,Sandbox.Mount}[], env=Dict{String,String}(), kwargs...)
+    config = SandboxConfig(; rootfs=Sandbox.debian_rootfs(), mode, mounts,
+                           env=Dict("PATH" => default_path, env...), kwargs...)
+    p, out, err = sandbox_run(config, `/bin/sh -c $(script)`)
+    return success(p), out, err
 end
 
 host_cgroup2 = any(eachline("/proc/self/mounts")) do line
@@ -71,13 +51,13 @@ const delegated_escapes = raw"""
     echo "$(cat /proc/self/cgroup) end"
     """
 
-for executor in userns_executors
-    @testset "$(executor) isolation" begin
+for mode in modes
+    @testset "isolation ($(mode))" begin
         @testset "file maps create parent directories" begin
             mktempdir() do dir
                 write(joinpath(dir, "note.txt"), "great success")
-                ok, out, err = sandbox_sh(executor, "cat /does/not/exist/note.txt";
-                    mounts=Dict("/does/not/exist/note.txt" => MountInfo(joinpath(dir, "note.txt"), MountType.ReadOnly)))
+                ok, out, err = sandbox_sh(mode, "cat /does/not/exist/note.txt";
+                    mounts=["/does/not/exist/note.txt" => Bind(joinpath(dir, "note.txt"))])
                 @test ok
                 @test out == "great success"
                 @test isempty(err)
@@ -87,31 +67,30 @@ for executor in userns_executors
         @testset "map destinations are resolved in the rootfs" begin
             mktempdir() do dir
                 write(joinpath(dir, "note.txt"), "great success")
-                note = MountInfo(joinpath(dir, "note.txt"), MountType.ReadOnly)
+                note = Bind(joinpath(dir, "note.txt"))
                 host_target = joinpath(dir, "created_by_sandbox")
-                stdout, stderr = IOBuffer(), IOBuffer()
-                config(mounts...) = SandboxConfig(
-                    Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
-                    Dict("PATH" => "/usr/bin:/bin");
-                    stdout, stderr, persist=true,
-                )
-                with_executor(executor) do exe
+                persist = new_persist_dir()
+                config(mounts...) = SandboxConfig(; rootfs=Sandbox.debian_rootfs(), mode, persist,
+                                                  mounts=collect(mounts), env=Dict("PATH" => "/usr/bin:/bin"))
+                try
                     # Symlinks left behind by an earlier run: one pointing at the host
                     # path, a dangling relative one like Ubuntu's /etc/resolv.conf, and
                     # one to the root
-                    @test success(exe, config(), `/bin/sh -c """
+                    @test success(run(config(), `/bin/sh -c """
                         ln -s $(host_target) /escape
                         ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
                         ln -s / /root_alias
-                        """`)
-                    @test success(exe, config("/escape" => note, "/etc/resolv.conf" => note),
-                                  `/bin/sh -c "cat /escape; cat /etc/resolv.conf"`)
+                        """`))
+                    p, out, err = sandbox_run(config("/escape" => note, "/etc/resolv.conf" => note),
+                                              `/bin/sh -c "cat /escape; cat /etc/resolv.conf"`)
+                    @test out == "great success"^2
                     # A map cannot replace the root, even with a working rootfs
-                    @test !success(exe, config("/root_alias" => MountInfo(Sandbox.debian_rootfs(), MountType.ReadOnly)),
-                                   `/bin/true`)
+                    p, out, err = sandbox_run(config("/root_alias" => Bind(Sandbox.debian_rootfs())), `/bin/true`)
+                    @test !success(p)
+                    @test occursin("it is the root of the sandbox", err)
+                finally
+                    remove_persist(persist, mode)
                 end
-                @test String(take!(stdout)) == "great success"^2
-                @test occursin("it is the root of the sandbox", String(take!(stderr)))
                 @test !ispath(host_target)
             end
         end
@@ -119,8 +98,8 @@ for executor in userns_executors
         @testset "maps of any host path" begin
             # Without `persist`, the rootfs changes go in a tmpfs, which must not hide
             # a host directory from the maps
-            ok, out, err = sandbox_sh(executor, "test -x /hostbin/sh && echo found";
-                mounts=Dict("/hostbin" => MountInfo("/bin", MountType.ReadOnly)))
+            ok, out, err = sandbox_sh(mode, "test -x /hostbin/sh && echo found";
+                mounts=["/hostbin" => Bind("/bin")])
             @test ok
             @test out == "found\n"
         end
@@ -129,7 +108,7 @@ for executor in userns_executors
             # The procfs of the command's PID namespace is its own to unmount, which must
             # not reveal a procfs of the host's
             host_init = replace(read("/proc/1/cmdline", String), '\0' => ' ')
-            ok, out, err = sandbox_sh(executor, "umount /proc && tr '\\0' ' ' < /proc/1/cmdline")
+            ok, out, err = sandbox_sh(mode, "umount /proc && tr '\\0' ' ' < /proc/1/cmdline")
             @test ok
             @test !isempty(out)
             @test out != host_init
@@ -137,7 +116,7 @@ for executor in userns_executors
 
         @testset "no mount propagation from the host" begin
             # None of the sandbox's mounts is a peer or slave of a host mount
-            ok, out, err = sandbox_sh(executor, "grep -cE ' (shared|master):' /proc/self/mountinfo")
+            ok, out, err = sandbox_sh(mode, "grep -cE ' (shared|master):' /proc/self/mountinfo")
             @test out == "0\n"
         end
 
@@ -147,15 +126,15 @@ for executor in userns_executors
             env = Dict("SANDBOX_MOUNT_SETATTR" => setattr)
             # mounts below `dir` that are not read-only
             writable(dir) = "awk '(\$2 == \"$(dir)\" || \$2 ~ \"^$(dir)/\") && \$4 !~ /^ro(,|\$)/' /proc/self/mounts"
-            ok, out, err = sandbox_sh(executor, writable("/sys"); env)
+            ok, out, err = sandbox_sh(mode, writable("/sys"); env)
             @test ok
             @test out == ""
 
             if host_sys_submounts
-                ok, out, err = sandbox_sh(executor, """
+                ok, out, err = sandbox_sh(mode, """
                     grep -c ' /hostsys/' /proc/self/mounts
                     $(writable("/hostsys"))
-                    """; env, mounts=Dict("/hostsys" => MountInfo("/sys", MountType.ReadOnly)))
+                    """; env, mounts=["/hostsys" => Bind("/sys")])
                 @test ok
                 @test parse(Int, readline(IOBuffer(out))) > 0
                 @test countlines(IOBuffer(out)) == 1
@@ -163,7 +142,7 @@ for executor in userns_executors
 
             # Nested mounts at a path that /proc/self/mountinfo shows longer than
             # PATH_MAX, as it escapes spaces (mounting them on the host takes root)
-            if PrivilegedUserNamespacesExecutor in userns_executors
+            if :sudo in modes
                 mktempdir() do dir
                     rel = joinpath(fill(" "^64, 20)...)
                     outer = joinpath(dir, rel)
@@ -174,8 +153,8 @@ for executor in userns_executors
                         mkdir(inner)
                         run(`sudo -n mount -t tmpfs -o mode=1777 none $(inner)`)
                         for path in (joinpath("/m", rel, "x"), joinpath("/m", rel, "inner", "x"))
-                            ok, out, err = sandbox_sh(executor, "touch '$(path)'"; env,
-                                mounts=Dict("/m" => MountInfo(dir, MountType.ReadOnly)))
+                            ok, out, err = sandbox_sh(mode, "touch '$(path)'"; env,
+                                mounts=["/m" => Bind(dir)])
                             @test !ok
                             @test occursin("Read-only file system", err)
                         end
@@ -188,14 +167,14 @@ for executor in userns_executors
 
         @testset "no device nodes or setuid in the image" begin
             # A world-writable device node, as an image could contain (making one
-            # takes root, which we have if the privileged executor is tested)
-            if PrivilegedUserNamespacesExecutor in userns_executors
+            # takes root, which we have if the sudo mode is tested)
+            if :sudo in modes
                 mktempdir() do dir
                     node = joinpath(dir, "null")
                     run(`sudo -n mknod -m 666 $(node) c 1 3`)
                     try
-                        ok, out, err = sandbox_sh(executor, "echo > /image/null";
-                            mounts=Dict("/image" => MountInfo(dir, MountType.Overlayed)))
+                        ok, out, err = sandbox_sh(mode, "echo > /image/null";
+                            mounts=["/image" => Overlay(dir)])
                         @test !ok
                         @test occursin("Permission denied", err)
                     finally
@@ -203,13 +182,13 @@ for executor in userns_executors
                     end
                 end
             end
-            ok, out, err = sandbox_sh(executor, "grep -E ' / ' /proc/self/mounts | tail -n 1")
+            ok, out, err = sandbox_sh(mode, "grep -E ' / ' /proc/self/mounts | tail -n 1")
             @test ok
             @test issubset(["nodev", "nosuid"], split(split(out)[4], ','))
         end
 
         # Only for callers that do not have root's identity themselves
-        if PrivilegedUserNamespacesExecutor in userns_executors &&
+        if :sudo in modes &&
            Sandbox.getuid() != 0 && Sandbox.getgid() != 0
             @testset "no supplementary groups of root" begin
                 # A host file that only root and its group can read
@@ -219,8 +198,8 @@ for executor in userns_executors
                     run(`sudo -n chown root:root $(secret)`)
                     run(`sudo -n chmod 640 $(secret)`)
                     try
-                        ok, out, err = sandbox_sh(executor, "cat /m/secret";
-                            mounts=Dict("/m" => MountInfo(dir, MountType.ReadOnly)))
+                        ok, out, err = sandbox_sh(mode, "cat /m/secret";
+                            mounts=["/m" => Bind(dir)])
                         @test !ok
                         @test occursin("Permission denied", err)
                     finally
@@ -236,7 +215,7 @@ for executor in userns_executors
             host_shm = isdir("/dev/shm") ? joinpath("/dev/shm", marker) : nothing
             host_shm === nothing || touch(host_shm)
             try
-                ok, out, err = sandbox_sh(executor, """
+                ok, out, err = sandbox_sh(mode, """
                     readlink /proc/self/ns/ipc
                     stat -f -c %T /dev/shm
                     stat -c %a /dev/shm
@@ -254,14 +233,14 @@ for executor in userns_executors
 
             # The size of /dev/shm can be limited
             script = "dd if=/dev/zero of=/dev/shm/blob bs=1M count=16"
-            @test sandbox_sh(executor, script; shm_size="32M")[1]
-            ok, out, err = sandbox_sh(executor, script; shm_size="8M")
+            @test sandbox_sh(mode, script; mounts=["/dev/shm" => Tmpfs(size="32M", mode=0o1777)])[1]
+            ok, out, err = sandbox_sh(mode, script; mounts=["/dev/shm" => Tmpfs(size="8M", mode=0o1777)])
             @test !ok
             @test occursin("No space left on device", err)
         end
 
         @testset "cgroup namespace and read-only cgroup2 view" begin
-            ok, out, err = sandbox_sh(executor, """
+            ok, out, err = sandbox_sh(mode, """
                 readlink /proc/self/ns/cgroup
                 grep '^0::' /proc/self/cgroup || echo none
                 stat -f -c %T /sys/fs/cgroup
@@ -278,15 +257,15 @@ for executor in userns_executors
                 @test fstype == "cgroup2"
                 @test "ro" in split(options, ',')
                 # The view is rooted at the cgroup the sandbox was started in, which for
-                # the unprivileged executor is ours.
-                if executor == UnprivilegedUserNamespacesExecutor
+                # the :userns mode is ours.
+                if mode == :userns
                     @test Set(split(lines[5])) == Set(readdir(host_cgroup_dir()))
                 end
 
                 # Neither limits nor membership can be changed through it
-                @test !sandbox_sh(executor, "echo max > /sys/fs/cgroup/memory.max")[1]
-                @test !sandbox_sh(executor, "echo \$\$ > /sys/fs/cgroup/cgroup.procs")[1]
-                @test !sandbox_sh(executor, "mkdir /sys/fs/cgroup/child")[1]
+                @test !sandbox_sh(mode, "echo max > /sys/fs/cgroup/memory.max")[1]
+                @test !sandbox_sh(mode, "echo \$\$ > /sys/fs/cgroup/cgroup.procs")[1]
+                @test !sandbox_sh(mode, "mkdir /sys/fs/cgroup/child")[1]
             else
                 @test lines[3] == "tmpfs"
                 @test isempty(strip(lines[5]))
@@ -308,7 +287,7 @@ for executor in userns_executors
                 "own cgroupns" => "mkdir -p /tmp/cg && unshare -C sh -c 'mount -t cgroup2 none /tmp/cg && echo max > /tmp/cg/memory.max'",
             ]
             for (name, script) in escapes
-                ok, out, err = sandbox_sh(executor, script)
+                ok, out, err = sandbox_sh(mode, script)
                 @test !ok
                 ok && @error("Escape '$(name)' succeeded", script, out, err)
             end
@@ -319,7 +298,7 @@ for executor in userns_executors
             # hostname.
             all_caps = string((UInt64(1) << (parse(Int, readchomp("/proc/sys/kernel/cap_last_cap")) + 1)) - 1;
                               base=16, pad=16)
-            ok, out, err = sandbox_sh(executor, """
+            ok, out, err = sandbox_sh(mode, """
                 id -u
                 grep CapEff /proc/self/status | cut -f2
                 mkdir -p /tmp/t && mount -t tmpfs none /tmp/t && echo mounted
@@ -337,22 +316,16 @@ for executor in userns_executors
                     driver = joinpath(dir, "driver.sh")
                     write(driver, delegated_driver)
                     stdout, stderr = IOBuffer(), IOBuffer()
-                    config = SandboxConfig(
-                        Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed),
-                             "/info" => MountInfo(dir, MountType.ReadOnly)),
-                        Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-                        persist=false,
-                    )
-                    with_executor(executor) do exe
-                        inner = Sandbox.build_executor_command(exe, config, `/bin/sh -c $(delegated_escapes)`)
-                        cmd = `systemd-run --user --scope --quiet -p Delegate=yes /bin/bash $(driver) $(inner.exec)`
-                        # systemd-run needs to reach the user manager
-                        env = copy(something(inner.env, String[]))
-                        for var in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-                            haskey(ENV, var) && push!(env, "$(var)=$(ENV[var])")
-                        end
-                        run(pipeline(setenv(cmd, env); stdout, stderr))
+                    config = SandboxConfig(; rootfs=Sandbox.debian_rootfs(), mode,
+                                           mounts=["/info" => Bind(dir)], env=Dict("PATH" => default_path))
+                    inner = command(config, `/bin/sh -c $(delegated_escapes)`)
+                    cmd = `systemd-run --user --scope --quiet -p Delegate=yes /bin/bash $(driver) $(inner.exec)`
+                    # systemd-run needs to reach the user manager
+                    env = copy(inner.env)
+                    for var in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+                        haskey(ENV, var) && push!(env, "$(var)=$(ENV[var])")
                     end
+                    run(pipeline(setenv(cmd, env); stdout, stderr))
                     out, err = String(take!(stdout)), String(take!(stderr))
                     results = split(strip(out), '\n')
                     @test length(results) == 7
