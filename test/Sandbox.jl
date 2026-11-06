@@ -156,6 +156,22 @@ for executor in all_executors
             end
         end
 
+        @testset "redirected user command" begin
+            stdout = IOBuffer()
+            config = SandboxConfig(Dict("/" => rootfs_dir); stdout)
+            mktempdir() do dir
+                path = joinpath(dir, "stderr")
+                buf = IOBuffer()
+                cmd = pipeline(`/bin/sh -c "echo out; echo err >&2"`; stdout=buf, stderr=path)
+                with_executor(executor) do exe
+                    @test success(exe, config, cmd)
+                end
+                @test String(take!(buf)) == "out\n"
+                @test read(path, String) == "err\n"
+                @test isempty(take!(stdout))
+            end
+        end
+
         # While we don't strictly care about read-only mounts, we might in the future,
         # so we ensure they're supported.  What we _truly_ care about is Overlayed,
         # mounts, where the modifications are visible only inside the sandbox, and are
