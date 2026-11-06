@@ -86,6 +86,30 @@ for executor in all_executors
                 @test success(exe, config, user_cmd)
                 @test String(take!(stdout)) == "for science my friend\n";
             end
+
+            # The command should see exactly the requested environment, with nothing added by
+            # `sudo` (`HOME`, `USER`, `SUDO_*`, ...) and nothing written to stderr.
+            if executor <: UserNamespacesExecutor
+                stdout = IOBuffer()
+                stderr = IOBuffer()
+                config = SandboxConfig(
+                    Dict("/" => rootfs_dir),
+                    Dict{String,String}(),
+                    Dict("PATH" => "/usr/bin:/bin", "LD_LIBRARY_PATH" => "science");
+                    stdout, stderr,
+                )
+                user_cmd = setenv(`/usr/bin/env`, "SHELL" => "friend")
+                with_executor(executor) do exe
+                    @test success(exe, config, user_cmd)
+                    @test sort(split(String(take!(stdout)), '\n'; keepempty=false)) == [
+                        "FORCE_SANDBOX_MODE=unprivileged",  # set by the sandbox, for nesting
+                        "LD_LIBRARY_PATH=science",
+                        "PATH=/usr/bin:/bin",
+                        "SHELL=friend",
+                    ]
+                    @test print_if_nonempty(take!(stderr))
+                end
+            end
         end
 
         @testset "reading from mounts" begin
