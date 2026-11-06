@@ -241,6 +241,19 @@ for mode in launcher_modes
                 end
             end
 
+            # Paths with characters that overlayfs's options give a meaning to
+            mktempdir() do dir
+                lower, persist = joinpath(dir, "lower"), joinpath(dir, "p,q\\r:s")
+                mkdir(lower)
+                ops = `--overlay $(lower) /a,b/o --overlay $(lower) /a\\b:c/o`
+                for (script, expected) in ["echo 1 > /a,b/o/f; echo 2 > /a\\\\b:c/o/f" => "",
+                                           "cat /a,b/o/f /a\\\\b:c/o/f" => "1\n2\n"]
+                    code, out, err = launch(mode, ops, script; options=`--persist $(persist)`)
+                    @test (code, out) == (0, expected)
+                end
+                run(mode == :sudo ? `sudo -n rm -rf $(persist)` : `chmod -R u+rwX $(persist)`)
+            end
+
             # Overlays at different places keep their changes apart.  These two
             # destinations had the same 32-bit hash in the name of their state.
             mktempdir() do dir

@@ -309,19 +309,24 @@ static int open_dest(int root_fd, const struct op *op, mode_t create) {
 
 /*
  * The name of the directories that hold an overlay's changes: its destination, with `/`
- * and `%` escaped.  Unlike a hash, that can't be the same for two destinations, and it
+ * and `%` escaped, and the characters that mean something in overlayfs's options (`,`,
+ * `:` and `\`).  Unlike a hash, that can't be the same for two destinations, and it
  * can't be "rootfs", the rootfs's.
  */
 static void state_name(char *name, const char *dest) {
   size_t n = 0;
   for (const char *c = dest; *c != '\0'; c++) {
-    const char *escaped = *c == '/' ? "%2F" : *c == '%' ? "%25" : NULL;
-    size_t len = escaped ? 3 : 1;
+    char escaped[4];
+    size_t len = 1;
+    if (strchr("/%,:\\", *c) != NULL) {
+      snprintf(escaped, sizeof(escaped), "%%%02X", (unsigned char)*c);
+      len = 3;
+    }
     if (n + len > NAME_MAX) {
       fprintf(stderr, "ERROR: Failed to mount an overlay at '%s': the destination is too long\n", dest);
       _exit(EXIT_SANDBOX_FAILED);
     }
-    memcpy(name + n, escaped ? escaped : c, len);
+    memcpy(name + n, len == 3 ? escaped : c, len);
     n += len;
   }
   name[n] = '\0';
@@ -611,31 +616,32 @@ static void mount_the_world(uid_t uid, gid_t gid) {
   // host directory, it would hide whatever is below that directory from the sources.
   // So it goes over the rootfs directory itself: the rootfs is opened beforehand to be
   // the overlay's lower layer, and the overlay then covers the tmpfs, which stays
-  // reachable for the overlay operations through `scratch_fd`.
-  const char *work_dir = persist_dir;
-  const char *lower_dir = sandbox_root;
-  char lower_path[FD_PATH_SIZE], scratch_path[FD_PATH_SIZE];
-  int lower_fd = -1, scratch_fd = -1;
-  if (persist_dir == NULL) {
-    lower_fd = open_root(sandbox_root);
-    fd_path(lower_path, lower_fd);
-    lower_dir = lower_path;
-
+  // reachable through its descriptor.
+  //
+  // The rootfs and persist directory go in overlayfs's options by descriptor, as their
+  // paths may contain characters that mean something there.
+  char lower_dir[FD_PATH_SIZE], work_dir[FD_PATH_SIZE];
+  int lower_fd = open_root(sandbox_root), work_fd = -1;
+  fd_path(lower_dir, lower_fd);
+  if (persist_dir != NULL) {
+    work_fd = open(persist_dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    check(work_fd != -1);
+    fd_path(work_dir, work_fd);
+  } else {
     char options[64];
     int n = snprintf(options, sizeof(options), "size=%s", tmpfs_size ? tmpfs_size : "1G");
     check(0 < n && n < sizeof(options));
-    if (0 != mount("tmpfs", lower_path, "tmpfs", 0, options)) {
+    if (0 != mount("tmpfs", lower_dir, "tmpfs", 0, options)) {
       fprintf(stderr, "ERROR: Failed to mount the tmpfs for the changes to the rootfs (%s): %s (errno %d)\n",
               options, strerror(errno), errno);
       _exit(EXIT_SANDBOX_FAILED);
     }
 
-    scratch_fd = open_root(sandbox_root);
-    fd_path(scratch_path, scratch_fd);
-    work_dir = scratch_path;
+    work_fd = open_root(sandbox_root);
+    fd_path(work_dir, work_fd);
   }
   if (verbose) {
-    fprintf(stderr, "--> Creating overlay workdir at %s\n", work_dir);
+    fprintf(stderr, "--> Creating overlay workdir at %s\n", persist_dir ? persist_dir : "a tmpfs");
   }
   if (persist_dir == NULL) {
     // Real root sets trusted xattrs on a tmpfs.  Anyone else needs `userxattr`, which a
@@ -660,10 +666,8 @@ static void mount_the_world(uid_t uid, gid_t gid) {
   run_ops(root_fd, work_dir, uid, gid);
 
   close(root_fd);
-  if (lower_fd != -1) {
-    close(lower_fd);
-    close(scratch_fd);
-  }
+  close(lower_fd);
+  close(work_fd);
 }
 
 
