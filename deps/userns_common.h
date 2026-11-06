@@ -84,7 +84,6 @@ int open_proc_file(pid_t pid, const char *file, int mode);
 void mkpath(const char * dir);
 int isdir(const char * path);
 void rmrf(const char * path);
-void hashed_basename(char *output, const char *path);
 
 /* Paths inside the sandbox */
 #define FD_PATH_SIZE 32
