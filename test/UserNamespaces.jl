@@ -144,6 +144,21 @@ if should_build_local_sandbox && UserNSSandbox_jll.is_available()
             @test !success(pipeline(`$(exe) --no-such-option`; stderr))
             @test occursin("no-such-option", String(take!(stderr)))
         end
+
+        # Failures of the sandbox itself exit with 125, so that they can't be mistaken
+        # for the command failing
+        exe = UserNSSandbox_jll.sandbox_path
+        rootfs = Sandbox.debian_rootfs()
+        for args in [`--no-such-option --rootfs $(rootfs) /bin/true`,
+                     `--rootfs $(rootfs)`,
+                     `/bin/true`,
+                     `--rootfs $(rootfs) --mount relative:/mnt /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp:/mnt:bogus /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp /bin/true`,
+                     `--rootfs /does/not/exist /bin/true`]
+            p = run(pipeline(ignorestatus(`$(exe) $(args)`); stderr=devnull))
+            @test p.exitcode == 125
+        end
     end
 end
 

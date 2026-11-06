@@ -52,6 +52,13 @@
 #define TRUE 1
 #define FALSE 0
 #define TRUEFALSE_EXITCODE(x) ((x) == TRUE ? 0 : 1)
+
+/* Exit codes that tell our own failures apart from the command's, as chosen by `env`,
+   `chroot` and container runtimes: the sandbox could not be set up, or the command
+   could not be executed or found. */
+#define EXIT_SANDBOX_FAILED 125
+#define EXIT_CANNOT_EXECUTE 126
+#define EXIT_NOT_FOUND 127
 extern unsigned char verbose;
 extern pid_t child_pid;
 

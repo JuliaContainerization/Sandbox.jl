@@ -257,7 +257,7 @@ static void mount_private(const char * root_dir, const char * shm_size) {
     if (0 != mount("cgroup2", staging, "cgroup2", cgroup_flags, NULL)) {
       fprintf(stderr, "ERROR: Failed to mount cgroup2: %s (errno %d)\n",
               strerror(errno), errno);
-      _exit(1);
+      _exit(EXIT_SANDBOX_FAILED);
     }
     check(0 == mount(NULL, staging, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|cgroup_flags, NULL));
     check(0 == mount(staging, path, NULL, MS_MOVE, NULL));
@@ -295,7 +295,7 @@ static void lock_sandbox() {
   if (0 != unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC)) {
     fprintf(stderr, "ERROR: Failed to create the nested user namespace that locks the sandbox: %s (errno %d)\n",
             strerror(errno), errno);
-    _exit(1);
+    _exit(EXIT_SANDBOX_FAILED);
   }
   // In privileged mode, `setuid()` reset our dumpability, which leaves our /proc
   // entries owned by an unmapped root and keeps us from writing our own maps.
@@ -321,7 +321,7 @@ static void die_with_launcher(int status_fd) {
   struct pollfd pfd = {.fd = status_fd, .events = 0};
   check(0 <= poll(&pfd, 1, 0));
   if (pfd.revents & POLLERR) {
-    _exit(1);
+    _exit(EXIT_SANDBOX_FAILED);
   }
 }
 
@@ -394,12 +394,13 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
       fprintf(stderr, "\n");
     }
     execve(sandbox_argv[0], sandbox_argv, environ);
-    fprintf(stderr, "ERROR: Failed to run %s: %d (%s)\n", sandbox_argv[0], errno, strerror(errno));
+    int exec_errno = errno;
+    fprintf(stderr, "ERROR: Failed to run %s: %d (%s)\n", sandbox_argv[0], exec_errno, strerror(exec_errno));
 
     // Flush to make sure we've said all we're going to before we _exit()
     fflush(stdout);
     fflush(stderr);
-    _exit(1);
+    _exit((exec_errno == ENOENT || exec_errno == ENOTDIR) ? EXIT_NOT_FOUND : EXIT_CANNOT_EXECUTE);
   }
 
   // We want to pass signals through to our child
@@ -410,35 +411,22 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   for (;;) {
     pid_t reaped_pid = waitpid(-1, &status, 0);
     if (reaped_pid == -1) {
-      if (errno == ECHILD) {
-        // Somehow we missed the reaping of our child - this shouldn't happen,
-        // but let's make sure we don't hang forever if it somehow does.
-        check(-2);
-      }
-      if (errno != EINTR) {
-        // Some other unexpected error
-        check(-1);
-      }
+      // ECHILD would mean we missed the exit of the main pid; don't wait forever.
+      check(errno == EINTR);
       continue;
     }
     if (reaped_pid == child_pid) {
       // If it was the main pid that exited, we're going to exit too.
       // If we died of a signal, return that signal + 256, which we will
       // notice on the other end as a signal.
+      uint32_t reported_exit_code;
       if (WIFSIGNALED(status)) {
-        uint32_t reported_exit_code = 256 + WTERMSIG(status);
-        check(sizeof(uint32_t) == write(parent_pipe[1], &reported_exit_code, sizeof(uint32_t)));
-        return 0;
+        reported_exit_code = 256 + WTERMSIG(status);
+      } else {
+        reported_exit_code = WEXITSTATUS(status);
       }
-      if (WIFEXITED(status)) {
-        // Normal exits get reported in a more straightforward fashion
-        uint32_t reported_exit_code = WEXITSTATUS(status);
-        check(sizeof(uint32_t) == write(parent_pipe[1], &reported_exit_code, sizeof(uint32_t)));
-        return 0;
-      }
-
-      // Unsure what's going on here, but it isn't good.
-      check(-1);
+      check(sizeof(uint32_t) == write(parent_pipe[1], &reported_exit_code, sizeof(uint32_t)));
+      return 0;
     }
   }
 }
@@ -475,7 +463,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
       execution_mode = UNPRIVILEGED_CONTAINER_MODE;
     } else {
       fprintf(stderr, "ERROR: Unknown FORCE_SANDBOX_MODE argument \"%s\"\n", forced_mode);
-      _exit(1);
+      _exit(EXIT_SANDBOX_FAILED);
     }
   } else {
     if(geteuid() == 0) {
@@ -548,7 +536,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
         // getopt already printed what was wrong; an option we don't know must not
         // look like a successful run to a caller that expected it to take effect.
         print_help();
-        return 1;
+        return EXIT_SANDBOX_FAILED;
       case 'v':
         verbose = 1;
         fprintf(stderr, "verbose sandbox enabled (running in ");
@@ -580,14 +568,17 @@ int main(int sandbox_argc, char **sandbox_argv) {
       case 'm': {
         // Find the colon in "from:to"
         char *colon = strchr(optarg, ':');
-        check(colon != NULL);
+        if (colon == NULL) {
+          fprintf(stderr, "ERROR: --mount \"%s\" is not of the form <from>:<to>[:<type>]!\n", optarg);
+          return EXIT_SANDBOX_FAILED;
+        }
 
         // Extract "from" and "to"
         char *from = strndup(optarg, (colon - optarg));
         char *to = strdup(colon + 1);
         if (from[0] != '/') {
-          fprintf(stderr, "ERROR: Outside path \"%s\" must be absolute!  Ignoring...\n", from);
-          break;
+          fprintf(stderr, "ERROR: Outside path \"%s\" must be absolute!\n", from);
+          return EXIT_SANDBOX_FAILED;
         }
 
         // Look for mount options
@@ -606,8 +597,8 @@ int main(int sandbox_argc, char **sandbox_argv) {
           } else if (strcmp(mount_str, "rw") == 0) {
             mount_type = MOUNT_TYPE_READWRITE;
           } else {
-            fprintf(stderr, "ERROR: Unknown mount type in \"%s\" -> \"%s\" with type \"%s\"!  Ignoring...\n", from, to, mount_str);
-            break;
+            fprintf(stderr, "ERROR: Unknown mount type in \"%s\" -> \"%s\" with type \"%s\"!\n", from, to, mount_str);
+            return EXIT_SANDBOX_FAILED;
           }
         }
 
@@ -671,7 +662,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
         break;
       default:
         fputs("getoptlong defaulted?!\n", stderr);
-        return 1;
+        return EXIT_SANDBOX_FAILED;
     }
   }
 
@@ -692,14 +683,14 @@ int main(int sandbox_argc, char **sandbox_argv) {
   if (sandbox_argc == 0) {
     fputs("No <cmd> given!\n", stderr);
     print_help();
-    return 1;
+    return EXIT_SANDBOX_FAILED;
   }
 
   // If we haven't been given a sandbox root, die
   if (!sandbox_root) {
     fputs("--rootfs is required!\n", stderr);
     print_help();
-    return 1;
+    return EXIT_SANDBOX_FAILED;
   }
 
   // If we're running in one of the container modes, we're going to syscall() ourselves a
@@ -835,7 +826,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
     }
 
     // Don't bother failing later; just exit now.
-    return 1;
+    return EXIT_SANDBOX_FAILED;
   }
 
   // The sandboxed executable's exit value is reported via the pipe.  The child only
@@ -843,7 +834,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
   uint32_t child_exit_code = -1;
   if (sizeof(uint32_t) != read(parent_pipe[0], (void *)&child_exit_code, sizeof(uint32_t))) {
     fputs("ERROR: Sandbox exited without reporting the exit status of the command\n", stderr);
-    return 1;
+    return EXIT_SANDBOX_FAILED;
   }
 
   // We encode signal death as 256 + signal

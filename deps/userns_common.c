@@ -14,7 +14,7 @@ void _check(int ok, const char * file, int line) {
     fprintf(stderr, "%s:%d, ABORTED (%d: %s)!\n", file, line, errno, strerror(errno));
     fflush(stdout);
     fflush(stderr);
-    _exit(1);
+    _exit(EXIT_SANDBOX_FAILED);
   }
 }
 
@@ -309,7 +309,7 @@ void bind_mount(const char *src, const char *dest, char read_only) {
     fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': %s (errno %d)\n",
             resolved_src, dest, strerror(errno), errno);
     fprintf(stderr, "  Please ensure that '%s' exists and is accessible.\n", resolved_src);
-    _exit(1);
+    _exit(EXIT_SANDBOX_FAILED);
   }
   check(mount_result == 0);
 

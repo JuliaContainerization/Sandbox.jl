@@ -4,9 +4,9 @@ using Test, Sandbox
 # isolation tests, these cover behaviour the released UserNSSandbox_jll does not have yet,
 # and run against the executors that Isolation.jl found (`userns_executors`).
 
-function sandbox_config(; kwargs...)
+function sandbox_config(; mounts=Dict{String,MountInfo}(), kwargs...)
     return SandboxConfig(
-        Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed)),
+        Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
         Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         persist=false, kwargs...,
     )
@@ -67,6 +67,15 @@ for executor in userns_executors
                 p = sandbox_run(executor, `/bin/sh -c $(script)`; stderr=devnull)
                 @test p.exitcode == 3
             end
+        end
+
+        @testset "exit codes" begin
+            @test sandbox_run(executor, `/bin/sh -c 'exit 42'`).exitcode == 42
+            @test sandbox_run(executor, `/does/not/exist`; stderr=devnull).exitcode == 127
+            @test sandbox_run(executor, `/etc/passwd`; stderr=devnull).exitcode == 126
+            # The sandbox couldn't be set up
+            mounts = Dict("/mnt" => MountInfo("/does/not/exist", MountType.ReadOnly))
+            @test sandbox_run(executor, `/bin/true`; mounts, stderr=devnull).exitcode == 125
         end
 
         @testset "killing the launcher kills the sandbox" begin
