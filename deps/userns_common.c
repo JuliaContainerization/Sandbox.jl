@@ -414,7 +414,7 @@ uint8_t mount_overlay(const char * const * lowers, size_t num_lowers, const char
   if (userxattr) {
     userxattr_opt = ",userxattr";
   }
-  size_t opts_size = strlen(upper) + strlen(work) + strlen(userxattr_opt) + 32;
+  size_t opts_size = strlen(upper) + strlen(work) + strlen(userxattr_opt) + 42;
   for (size_t i = 0; i < num_lowers; i++) {
     opts_size += strlen(lowers[i]) + 2;
   }
@@ -430,7 +430,10 @@ uint8_t mount_overlay(const char * const * lowers, size_t num_lowers, const char
     check(n > 0 && (size_t)n < opts_size - len);
     len += n;
   }
-  n = snprintf(opts + len, opts_size - len, ",upperdir=%s,workdir=%s%s", upper, work, userxattr_opt);
+  // Without the index, which the kernel may enable by default: with it, the upper layer
+  // only mounts again over the lower layer it was made with, while a read-only overlay
+  // of another directory is how the changes made through an overlay are looked at.
+  n = snprintf(opts + len, opts_size - len, ",upperdir=%s,workdir=%s,index=off%s", upper, work, userxattr_opt);
   check(n > 0 && (size_t)n < opts_size - len);
 
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
