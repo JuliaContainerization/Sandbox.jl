@@ -179,6 +179,17 @@ for mode in launcher_modes
                 @test occursin("Read-only file system", err)
                 run(mode == :sudo ? `sudo -n rm -rf $(persist)` : `chmod -R u+rwX $(persist)`)
             end
+
+            # Overlays at different places keep their changes apart.  These two
+            # destinations had the same 32-bit hash in the name of their state.
+            mktempdir() do dir
+                lower, persist = joinpath(dir, "lower"), joinpath(dir, "persist")
+                mkdir(lower)
+                code, out, err = launch(mode, `--overlay $(lower) /d248049/o --overlay $(lower) /d276786/o`,
+                                        "echo a > /d248049/o/f; ls /d276786/o"; options=`--persist $(persist)`)
+                @test (code, out) == (0, "")
+                run(mode == :sudo ? `sudo -n rm -rf $(persist)` : `chmod -R u+rwX $(persist)`)
+            end
         end
     end
 end

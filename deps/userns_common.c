@@ -82,25 +82,6 @@ void rmrf(const char * path) {
   nftw(path, unlink_callback, 64, FTW_DEPTH | FTW_PHYS);
 }
 
-// One-byte-at-a-time hash based on Murmur's mix
-// Source: https://github.com/aappleby/smhasher/blob/master/src/Hashes.cpp
-// X-ref: https://stackoverflow.com/a/69812981/230778
-uint32_t string_hash(const char *str, uint32_t h) {
-    for (; *str; ++str) {
-        h ^= *str;
-        h *= 0x5bd1e995;
-        h ^= h >> 15;
-    }
-    return h;
-}
-
-// Given a path, return its basename plus a hash representing the rest of the path
-void hashed_basename(char *output, const char *path) {
-  uint32_t hash = string_hash(path, 0x5f3759df);
-  sprintf(output, "%s-%x", basename((char *)path), hash);
-}
-
-
 /**** Paths inside the sandbox *****
  *
  * Mount destinations are looked up in the rootfs before we enter it.  The rootfs, and
