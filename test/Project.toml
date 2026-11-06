@@ -1,0 +1,17 @@
+[deps]
+LazyArtifacts = "4af54fe1-eca0-43a8-85a7-787d91b784e3"
+Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+Preferences = "21216c6a-2e73-6563-6e65-726566657250"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Sandbox = "9307e30f-c43e-9ca7-d17c-c2dc59df670d"
+Scratch = "6c6a2e73-6563-6170-7368-637461726353"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+UserNSSandbox_jll = "b88861f7-1d72-59dd-91e7-a8cc876a4984"
+
+[compat]
+LazyArtifacts = "1"
+Pkg = "1"
+Preferences = "1"
+SHA = "0.7, 1"
+Scratch = "1"
+Test = "1"
