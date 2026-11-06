@@ -367,9 +367,10 @@ void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid,
  * discard any changes made to it when the overlayfs disappears.  This is how we protect our
  * rootfs and shards when mounting from a local filesystem, as well as how we convert a
  * read-only rootfs and shards to a read-write system when mounting from squashfs images.
+ * `flags` are the mount flags for mount(2).
  */
 uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
-                      const char * work_dir, uint8_t userxattr) {
+                      const char * work_dir, uint8_t userxattr, unsigned long flags) {
   char upper[PATH_MAX], work[PATH_MAX], opts[3*PATH_MAX+28];
 
   // Construct the location of our upper and work directories
@@ -402,9 +403,9 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s,workdir=%s%s", src, upper, work, userxattr_opt);
   
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
-  if (0 != mount("overlay", dest, "overlay", 0, opts)) {
+  if (0 != mount("overlay", dest, "overlay", flags, opts)) {
     if (verbose) {
-      fprintf(stderr, "----> mount(\"overlay\", \"%s\", \"overlay\", 0, \"%s\") failed: %d (%s)\n", dest, opts, errno, strerror(errno));
+      fprintf(stderr, "----> mount(\"overlay\", \"%s\", \"overlay\", %lu, \"%s\") failed: %d (%s)\n", dest, flags, opts, errno, strerror(errno));
     }
     return FALSE;
   }

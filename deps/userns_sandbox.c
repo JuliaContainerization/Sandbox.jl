@@ -182,7 +182,13 @@ static void mount_the_world(const char * root_dir,
   // without altering the actual rootfs image.  When running in privileged mode,
   // we're mounting before cloning, in unprivileged mode, we clone before calling
   // this mehod at all.
-  check(TRUE == mount_overlay(lower_dir, root_dir, "rootfs", persist_dir, userxattr));
+  // Device nodes and setuid/setgid bits in the image must not take effect.  Mounts
+  // made in a user namespace other than the initial one ignore device nodes anyway,
+  // but in privileged mode we mount as real root.  Bind mounts keep the flags of
+  // their source instead: the device nodes we bind from the host's /dev must keep
+  // working.
+  const unsigned long overlay_flags = MS_NODEV | MS_NOSUID;
+  check(TRUE == mount_overlay(lower_dir, root_dir, "rootfs", persist_dir, userxattr, overlay_flags));
   int root_fd = open_root(root_dir);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
@@ -206,7 +212,7 @@ static void mount_the_world(const char * root_dir,
       hashed_basename(&bname[0], entry->mount_point);
       int fd = open_in_root_or_die(root_fd, entry->mount_point, 0);
       fd_path(path, fd);
-      check(TRUE == mount_overlay(path, path, bname, persist_dir, userxattr));
+      check(TRUE == mount_overlay(path, path, bname, persist_dir, userxattr, overlay_flags));
       close(fd);
 
       // Each mount is stacked on what the path led to before, so look it up again.
@@ -216,7 +222,7 @@ static void mount_the_world(const char * root_dir,
 
       // If this is a "read-only" overlay mount, remount as read-only here.
       if (entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
-        check(0 == mount("overlay", path, "overlay", MS_REMOUNT|MS_RDONLY, ""));
+        check(0 == mount("overlay", path, "overlay", MS_REMOUNT|MS_RDONLY|overlay_flags, ""));
       }
       close(fd);
     }

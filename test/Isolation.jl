@@ -178,6 +178,28 @@ for executor in userns_executors
             end
         end
 
+        @testset "no device nodes or setuid in the image" begin
+            # A world-writable device node, as an image could contain (making one
+            # takes root, which we have if the privileged executor is tested)
+            if PrivilegedUserNamespacesExecutor in userns_executors
+                mktempdir() do dir
+                    node = joinpath(dir, "null")
+                    run(`sudo -n mknod -m 666 $(node) c 1 3`)
+                    try
+                        ok, out, err = sandbox_sh(executor, "echo > /image/null";
+                            mounts=Dict("/image" => MountInfo(dir, MountType.Overlayed)))
+                        @test !ok
+                        @test occursin("Permission denied", err)
+                    finally
+                        run(`sudo -n rm $(node)`)
+                    end
+                end
+            end
+            ok, out, err = sandbox_sh(executor, "grep -E ' / ' /proc/self/mounts | tail -n 1")
+            @test ok
+            @test issubset(["nodev", "nosuid"], split(split(out)[4], ','))
+        end
+
         @testset "private IPC namespace and /dev/shm" begin
             # A marker in the host's /dev/shm must not be visible inside
             marker = "sandbox-isolation-test-$(getpid())"
