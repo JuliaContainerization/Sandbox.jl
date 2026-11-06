@@ -428,12 +428,12 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   return TRUE;
 }
 
-/**** Read-only mounts *****
+/**** Restricted mounts *****
  *
- * A bind mount made read-only by MS_REMOUNT|MS_RDONLY is read-only on its own; the mounts
- * below it that came along with MS_REC stay writable.  mount_setattr(2) (Linux 5.12)
+ * A bind mount made read-only (or nodev, nosuid) by MS_REMOUNT is so on its own; the
+ * mounts below it that came along with MS_REC are not.  mount_setattr(2) (Linux 5.12)
  * changes a whole tree at once.  On older kernels, each mount of the tree is remounted
- * read-only by itself, as listed in /proc/self/mountinfo.
+ * by itself, as listed in /proc/self/mountinfo.
  */
 
 #ifndef SYS_mount_setattr
@@ -446,6 +446,8 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
 #define MS_NOSYMFOLLOW 256
 #endif
 #define SANDBOX_MOUNT_ATTR_RDONLY 0x00000001
+#define SANDBOX_MOUNT_ATTR_NOSUID 0x00000002
+#define SANDBOX_MOUNT_ATTR_NODEV 0x00000004
 
 struct sandbox_mount_attr {
   uint64_t attr_set;
@@ -520,10 +522,10 @@ struct mountinfo_entry {
 };
 
 /*
- * Remounts read-only, by themselves, the mount at `fd` and every mount below it in
- * /proc/self/mountinfo.  The submounts are looked up from `fd`, by their path below it.
+ * Remounts with `flags` added, by themselves, the mount at `fd` and every mount below it
+ * in /proc/self/mountinfo.  The submounts are looked up from `fd`, by their path below it.
  */
-static void make_readonly_fallback(int fd, const char *dest) {
+static void restrict_mount_fallback(int fd, const char *dest, unsigned long flags) {
   struct mountinfo_entry *entries = NULL;
   size_t n_entries = 0, cap = 0;
   char *line = NULL;
@@ -603,12 +605,12 @@ static void make_readonly_fallback(int fd, const char *dest) {
     }
     fd_path(path, sub_fd);
     if (verbose) {
-      fprintf(stderr, "----> Remounting %s read-only\n", e->mount_point);
+      fprintf(stderr, "----> Remounting %s\n", e->mount_point);
     }
-    // Only add MS_RDONLY: the kernel refuses to clear the flags it locked on mounts
-    // that came from a more privileged mount namespace.
-    if (0 != mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|e->flags, NULL)) {
-      fprintf(stderr, "ERROR: Failed to make %s read-only (%s): %s (errno %d)\n",
+    // Only add flags: the kernel refuses to clear the flags it locked on mounts that
+    // came from a more privileged mount namespace.
+    if (0 != mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|flags|e->flags, NULL)) {
+      fprintf(stderr, "ERROR: Failed to restrict %s (%s): %s (errno %d)\n",
               dest, e->mount_point, strerror(errno), errno);
       _exit(EXIT_SANDBOX_FAILED);
     }
@@ -621,23 +623,27 @@ static void make_readonly_fallback(int fd, const char *dest) {
 }
 
 /*
- * Makes the mount at `fd`, and all mounts below it, read-only.  `dest` names it in
- * messages.  SANDBOX_MOUNT_SETATTR=0 skips mount_setattr(2), so that the tests can
- * exercise the fallback for older kernels.
+ * Adds `flags` (MS_RDONLY, MS_NOSUID and MS_NODEV) to the mount at `fd` and all mounts
+ * below it.  `dest` names it in messages.  SANDBOX_MOUNT_SETATTR=0 skips
+ * mount_setattr(2), so that the tests can exercise the fallback for older kernels.
  */
-void make_readonly(int fd, const char *dest) {
+void restrict_mount(int fd, const char *dest, unsigned long flags) {
   const char *use_setattr = getenv("SANDBOX_MOUNT_SETATTR");
   if (use_setattr == NULL || strcmp(use_setattr, "0") != 0) {
-    struct sandbox_mount_attr attr = { .attr_set = SANDBOX_MOUNT_ATTR_RDONLY };
+    struct sandbox_mount_attr attr = {
+      .attr_set = (flags & MS_RDONLY ? SANDBOX_MOUNT_ATTR_RDONLY : 0) |
+                  (flags & MS_NOSUID ? SANDBOX_MOUNT_ATTR_NOSUID : 0) |
+                  (flags & MS_NODEV ? SANDBOX_MOUNT_ATTR_NODEV : 0),
+    };
     if (0 == syscall(SYS_mount_setattr, fd, "", AT_EMPTY_PATH | AT_RECURSIVE, &attr, sizeof(attr)))
       return;
     if (errno != ENOSYS) {
-      fprintf(stderr, "ERROR: Failed to make %s read-only: %s (errno %d)\n",
+      fprintf(stderr, "ERROR: Failed to restrict %s: %s (errno %d)\n",
               dest, strerror(errno), errno);
       _exit(EXIT_SANDBOX_FAILED);
     }
   }
-  make_readonly_fallback(fd, dest);
+  restrict_mount_fallback(fd, dest, flags);
 }
 
 /*
@@ -669,14 +675,16 @@ void check_not_proc(int fd, const char *dest) {
 
 /*
  * Bind-mounts `src_fd` (the host path `src`) at `dest` in the rootfs `root_fd`, creating
- * the mount point as a directory or file to match it.
+ * the mount point as a directory or file to match it, and adds `flags` as for
+ * `restrict_mount()`.
  */
-void bind_mount(int root_fd, int src_fd, const char *src, const char *dest, char read_only) {
+void bind_mount(int root_fd, int src_fd, const char *src, const char *dest, unsigned long flags) {
   char src_path[FD_PATH_SIZE], dest_path[FD_PATH_SIZE];
 
   if (verbose) {
-    fprintf(stderr, "--> Bind-mounting %s over %s (%s)\n", src, dest,
-            read_only ? "read-only" : "read-write");
+    fprintf(stderr, "--> Bind-mounting %s over %s (%s%s%s)\n", src, dest,
+            flags & MS_RDONLY ? "read-only" : "read-write",
+            flags & MS_NOSUID ? ", nosuid" : "", flags & MS_NODEV ? ", nodev" : "");
   }
 
   struct stat src_stat;
@@ -692,10 +700,10 @@ void bind_mount(int root_fd, int src_fd, const char *src, const char *dest, char
   check(0 == mount(src_path, dest_path, "", MS_BIND|MS_REC, NULL));
   close(dest_fd);
 
-  if (read_only) {
+  if (flags) {
     // The new mount is on top of the mount point, so look it up again.
     dest_fd = open_in_root_or_die(root_fd, dest, 0);
-    make_readonly(dest_fd, dest);
+    restrict_mount(dest_fd, dest, flags);
     close(dest_fd);
   }
 }

@@ -8,19 +8,19 @@ if should_build_local_sandbox && UserNSSandbox_jll.is_available()
     Sys.which("sudo") !== nothing && success(`sudo -k -n true`) && push!(launcher_modes, :sudo)
 end
 
-function launcher_cmd(mode, args)
+function launcher_cmd(mode, args; env=String[])
     exe = UserNSSandbox_jll.sandbox_path
     if mode == :sudo
-        return `sudo -n /usr/bin/env -i PATH=/usr/bin:/bin SUDO_UID=$(Sandbox.getuid()) SUDO_GID=$(Sandbox.getgid()) FORCE_SANDBOX_MODE=privileged $(exe) $(args)`
+        return `sudo -n /usr/bin/env -i PATH=/usr/bin:/bin $(env) SUDO_UID=$(Sandbox.getuid()) SUDO_GID=$(Sandbox.getgid()) FORCE_SANDBOX_MODE=privileged $(exe) $(args)`
     end
-    return setenv(`$(exe) $(args)`, "PATH" => "/usr/bin:/bin", "FORCE_SANDBOX_MODE" => "unprivileged")
+    return setenv(`$(exe) $(args)`, ["PATH=/usr/bin:/bin", "FORCE_SANDBOX_MODE=unprivileged"; env])
 end
 
 # Runs `script` in a sandbox of the debian rootfs with the operations `ops`, returning
 # `(exitcode, stdout, stderr)`.
-function launch(mode, ops, script="true"; options=``)
+function launch(mode, ops, script="true"; options=``, env=String[])
     rootfs = Sandbox.debian_rootfs()
-    cmd = launcher_cmd(mode, `--rootfs $(rootfs) $(options) $(ops) -- /bin/sh -c $(script)`)
+    cmd = launcher_cmd(mode, `--rootfs $(rootfs) $(options) $(ops) -- /bin/sh -c $(script)`; env)
     out, err = IOBuffer(), IOBuffer()
     p = run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
     return p.exitcode, String(take!(out)), String(take!(err))
@@ -102,8 +102,43 @@ for mode in launcher_modes
         end
 
         @testset "binds" begin
-            code, out, err = launch(mode, `--bind /dev/null /dev/null`, "echo x > /dev/null && echo ok")
+            # Device nodes only work in dev- binds, and setuid bits never do
+            code, out, err = launch(mode, `--bind /dev/null /dev/null`, "echo x > /dev/null")
+            @test code != 0
+            @test occursin("Permission denied", err)
+            code, out, err = launch(mode, `--dev-bind /dev/null /dev/null`, "echo x > /dev/null && echo ok")
             @test (code, out) == (0, "ok\n")
+            options(dest) = "grep ' $(dest) ' /proc/self/mounts | cut -d' ' -f4"
+            mktempdir() do dir
+                code, out, err = launch(mode, `--bind $(dir) /a --dev-bind $(dir) /b --ro-dev-bind $(dir) /c`,
+                                        "$(options("/a")); $(options("/b")); $(options("/c"))")
+                @test code == 0
+                a, b, c = split.(split(out), ',')
+                @test "nosuid" in a && "nodev" in a && "rw" in a
+                @test "nosuid" in b && ("nodev" in b) == ("nodev" in split(readchomp(`findmnt -no OPTIONS --target $(dir)`), ','))
+                @test "nosuid" in c && "ro" in c
+            end
+            # Including the mounts below the bind (mounting them on the host takes root),
+            # also without mount_setattr(2), as before Linux 5.12
+            if :sudo in launcher_modes
+                mktempdir() do dir
+                    sub = mkdir(joinpath(dir, "sub"))
+                    run(`sudo -n mount -t tmpfs none $(sub)`)
+                    try
+                        @testset "mount_setattr: $(setattr)" for setattr in ("1", "0")
+                            code, out, err = launch(mode, `--bind $(dir) /a --dev-bind $(dir) /b`,
+                                                    "$(options("/a/sub")); $(options("/b/sub"))";
+                                                    env=["SANDBOX_MOUNT_SETATTR=$(setattr)"])
+                            @test code == 0
+                            a, b = split.(split(out), ',')
+                            @test "nosuid" in a && "nodev" in a
+                            @test "nosuid" in b && "nodev" ∉ b
+                        end
+                    finally
+                        run(`sudo -n umount $(sub)`)
+                    end
+                end
+            end
             code, out, err = launch(mode, `--ro-bind /etc /m`, "touch /m/x")
             @test code != 0
             @test occursin("Read-only file system", err)
