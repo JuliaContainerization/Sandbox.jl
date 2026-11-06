@@ -5,6 +5,6 @@ updates:
     schedule:
       interval: "monthly"
   - package-ecosystem: "julia"
-    directory: "/"
+    directories: ["/", "/docs"]
     schedule:
       interval: "monthly"
