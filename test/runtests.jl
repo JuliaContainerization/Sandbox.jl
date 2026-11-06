@@ -41,6 +41,7 @@ if Sandbox.getuid() == 0
     @warn("You are running Sandbox.jl tests as root!  This cannot test unprivileged namespaces!")
 end
 
+include("aqua.jl")
 include("SandboxConfig.jl")
 include("UserNamespaces.jl")
 include("Docker.jl")
