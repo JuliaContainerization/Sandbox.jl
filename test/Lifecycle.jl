@@ -48,6 +48,47 @@ function wait_until(f; timeout=10)
     return true
 end
 
+# Counts the SIGINTs it gets until it reads a line.  The handler is slow so that a second
+# SIGINT that arrives while it runs stays pending instead of merging with the first.
+const count_sigint_c = raw"""
+    #include <signal.h>
+    #include <stdio.h>
+    #include <time.h>
+    static volatile sig_atomic_t count = 0;
+    static void handler(int sig) {
+      count++;
+      struct timespec t = {0, 100000000};
+      nanosleep(&t, NULL);
+    }
+    int main() {
+      char line[16];
+      signal(SIGINT, handler);
+      printf("ready\n");
+      fflush(stdout);
+      fgets(line, sizeof(line), stdin);
+      printf("count=%d\n", (int)count);
+      return 0;
+    }
+    """
+
+# Run `cmd` as the foreground job of a job-control shell on a terminal of its own, and
+# type each of `keys` once it has printed "ready".  Returns everything that appeared on
+# the terminal.
+function run_on_terminal(cmd, keys)
+    shell = raw"""set -m; "$@"; echo "status=$?"; fg; echo done"""
+    inner = Base.shell_escape(`$(Sys.which("bash")) -c $(shell) -- $(cmd.exec)`)
+    terminal = `$(Sys.which("timeout")) 30 $(Sys.which("script")) -qfec $(inner) /dev/null`
+    proc = open(setenv(terminal, cmd.env), "r+")
+    out = readuntil(proc, "ready")
+    for key in keys
+        sleep(0.5)
+        write(proc, key)
+    end
+    out *= read(proc, String)
+    close(proc)
+    return replace(out, '\r' => "")
+end
+
 for executor in userns_executors
     @testset "$(executor) lifecycle" begin
         @testset "no launcher fds in the sandbox" begin
@@ -99,6 +140,54 @@ for executor in userns_executors
                     process_running(p) && kill(p, Base.SIGKILL)
                     pids = sandboxed()
                     isempty(pids) || run(ignorestatus(`$(sudo) kill -KILL $(pids)`))
+                end
+            end
+        end
+
+        @testset "dying of a signal" begin
+            # The launcher dies of the command's signal, but leaves the core to the command
+            mktempdir() do dir
+                with_executor(executor) do exe
+                    cmd = Sandbox.build_executor_command(exe, sandbox_config(), `/bin/sh -c 'kill -QUIT $$'`)
+                    script = raw"""ulimit -c unlimited 2>/dev/null; "$@"; echo $?"""
+                    stdout, stderr = IOBuffer(), IOBuffer()
+                    wrapper = setenv(`$(Sys.which("bash")) -c $(script) -- $(cmd.exec)`, cmd.env; dir)
+                    run(pipeline(wrapper; stdout, stderr))
+                    @test String(take!(stdout)) == "$(128 + Base.SIGQUIT)\n"
+                    # Under sudo, the process that dies is sudo, which may dump a core
+                    # of its own when it re-raises the signal (sudo-rs does).
+                    if executor == UnprivilegedUserNamespacesExecutor
+                        @test !occursin("core dumped", String(take!(stderr)))
+                        @test isempty(readdir(dir))
+                    end
+                end
+            end
+            @test sandbox_run(executor, `/bin/sh -c 'kill -QUIT $$'`).termsignal == Base.SIGQUIT
+        end
+
+        # Under sudo, the launcher would be on a terminal of sudo's
+        if executor == UnprivilegedUserNamespacesExecutor &&
+           all(exe -> Sys.which(exe) !== nothing, ("bash", "script", "timeout", "cc"))
+            @testset "terminal signals" begin
+                mktempdir() do dir
+                    write(joinpath(dir, "count.c"), count_sigint_c)
+                    run(`cc -static -O2 -o $(dir)/count $(dir)/count.c`)
+                    mounts = Dict("/count" => MountInfo(joinpath(dir, "count"), MountType.ReadOnly))
+                    with_executor(executor) do exe
+                        cmd = Sandbox.build_executor_command(exe, sandbox_config(; mounts), `/count`)
+
+                        # Each Ctrl-C reaches the command once
+                        out = run_on_terminal(cmd, ["\x03", "\x03", "\x03", "\n"])
+                        @test occursin("count=3\n", out)
+                        @test occursin("status=0\n", out)
+
+                        # Ctrl-Z stops the job (128 + SIGTSTP), which then continues in
+                        # the foreground
+                        out = run_on_terminal(cmd, ["\x1a", "\n"])
+                        @test occursin("status=$(128 + 20)\n", out)
+                        @test occursin("count=0\n", out)
+                        @test occursin("done\n", out)
+                    end
                 end
             end
         end

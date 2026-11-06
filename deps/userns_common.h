@@ -73,7 +73,6 @@ int isdir(const char * path);
 int islink(const char * path);
 void rmrf(const char * path);
 void hashed_basename(char *output, const char *path);
-void signal_passthrough(int sig);
 void setup_signal_forwarding();
 
 /* User namespaces */

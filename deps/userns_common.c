@@ -118,11 +118,19 @@ void hashed_basename(char *output, const char *path) {
  */
 
 pid_t child_pid;
-void signal_passthrough(int sig) {
-  kill(child_pid, sig);
+static void signal_passthrough(int sig, siginfo_t *info, void *context) {
+  int saved_errno = errno;
+  // The terminal signals its whole foreground process group, which the sandboxed
+  // processes share with us unless the command left it.  Don't deliver those twice.
+  if (!(info->si_code == SI_KERNEL && getpgid(child_pid) == getpgrp())) {
+    kill(child_pid, sig);
+  }
+  errno = saved_errno;
 }
 
-// The list of signals that we will forward to our child process
+// The list of signals that we will forward to our child process.  Job control signals
+// are not among them: the kernel stops and continues the whole process group, and a
+// handler for them would keep us from stopping along with the sandbox.
 int forwarded_signals[] = {
   SIGHUP,
   SIGINT,
@@ -130,17 +138,16 @@ int forwarded_signals[] = {
   SIGUSR1,
   SIGUSR2,
   SIGTERM,
-  SIGCONT,
-  SIGSTOP,
-  SIGTSTP,
-  SIGTTIN,
-  SIGTTOU,
   SIGWINCH
 };
 
 void setup_signal_forwarding() {
+  struct sigaction sa = {0};
+  sa.sa_sigaction = signal_passthrough;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&sa.sa_mask);
   for (int idx=0; idx<sizeof(forwarded_signals)/sizeof(int); idx++) {
-    signal(forwarded_signals[idx], signal_passthrough);
+    check(0 == sigaction(forwarded_signals[idx], &sa, NULL));
   }
 }
 

@@ -844,9 +844,18 @@ int main(int sandbox_argc, char **sandbox_argv) {
       fprintf(stderr, "Child Process %d signaled %d\n", child_pid, child_signal);
     }
 
-    // Kill ourselves with the same signal
+    // Kill ourselves with the same signal.  If that dumps core, the command already
+    // did; being undumpable also stops a core_pattern pipe, which ignores RLIMIT_CORE.
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     signal(child_signal, SIG_DFL);
-    check(raise(child_signal));
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, child_signal);
+    sigprocmask(SIG_UNBLOCK, &mask, NULL);
+    raise(child_signal);
+
+    // We're still here if the signal doesn't terminate by default.
+    return 128 + child_signal;
   } else {
     if (verbose) {
       fprintf(stderr, "Child Process %d exited with code %d\n", child_pid, child_exit_code);
