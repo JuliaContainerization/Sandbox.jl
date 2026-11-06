@@ -117,6 +117,15 @@ for executor in userns_executors
             end
         end
 
+        @testset "maps of any host path" begin
+            # Without `persist`, the rootfs changes go in a tmpfs, which must not hide
+            # a host directory from the maps
+            ok, out, err = sandbox_sh(executor, "test -x /hostbin/sh && echo found";
+                mounts=Dict("/hostbin" => MountInfo("/bin", MountType.ReadOnly)))
+            @test ok
+            @test out == "found\n"
+        end
+
         @testset "private IPC namespace and /dev/shm" begin
             # A marker in the host's /dev/shm must not be visible inside
             marker = "sandbox-isolation-test-$(getpid())"

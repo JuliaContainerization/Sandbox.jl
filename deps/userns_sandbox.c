@@ -133,20 +133,34 @@ static void mount_the_world(const char * root_dir,
   // directories wtihin `persist_dir`, but subsequent invocations of `sandbox`
   // with the same `--persist` argument will allow resuming execution inside of
   // a rootfs with the previous modifications intact.
+  const char * lower_dir = root_dir;
+  char lower_path[FD_PATH_SIZE], scratch_path[FD_PATH_SIZE];
+  int lower_fd = -1, scratch_fd = -1;
   if (persist_dir == NULL) {
-    // We know that `/bin` will always be available on basically any Linux
-    // system, so we mount our tmpfs here.
-    persist_dir = "/bin";
-    userxattr = 0;
-
     // Create tmpfs to store ephemeral changes.  These changes are lost once
     // the `tmpfs` is unmounted, which occurs when all processes within the
     // namespace exit and the mount namespace is destroyed.
+    //
+    // overlayfs needs the tmpfs to be reachable by path while it mounts, but
+    // mounted on a host directory, it would hide whatever is below that
+    // directory from the maps.  So it goes over the rootfs directory itself:
+    // the rootfs is opened beforehand to be the overlay's lower layer, and the
+    // overlay then covers the tmpfs, which stays reachable for the overlayed
+    // maps through `scratch_fd`.
+    userxattr = 0;
+    lower_fd = open_root(root_dir);
+    fd_path(lower_path, lower_fd);
+    lower_dir = lower_path;
+
     char options[32];
     int n = snprintf(options, 32, "size=%s", tmpfs_size);
     check(0 < n);
     check(n < 31);
-    check(0 == mount("tmpfs", "/bin", "tmpfs", 0, options));
+    check(0 == mount("tmpfs", lower_path, "tmpfs", 0, options));
+
+    scratch_fd = open_root(root_dir);
+    fd_path(scratch_path, scratch_fd);
+    persist_dir = scratch_path;
   }
 
   if (verbose) {
@@ -161,7 +175,7 @@ static void mount_the_world(const char * root_dir,
   // without altering the actual rootfs image.  When running in privileged mode,
   // we're mounting before cloning, in unprivileged mode, we clone before calling
   // this mehod at all.
-  check(TRUE == mount_overlay(root_dir, root_dir, "rootfs", persist_dir, userxattr));
+  check(TRUE == mount_overlay(lower_dir, root_dir, "rootfs", persist_dir, userxattr));
   int root_fd = open_root(root_dir);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
@@ -208,6 +222,10 @@ static void mount_the_world(const char * root_dir,
   // Mount /dev stuff
   mount_dev(root_fd);
   close(root_fd);
+  if (lower_fd != -1) {
+    close(lower_fd);
+    close(scratch_fd);
+  }
 }
 
 /*
