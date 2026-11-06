@@ -301,7 +301,7 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
 
             # The launcher mounts in the order given, so parents come before their children
             args = cmd.exec
-            dests = [args[i+2] for i in eachindex(args) if args[i] in ("--bind", "--ro-bind") && startswith(args[i+2], r"/usr|/etc")]
+            dests = [args[i+2] for i in eachindex(args) if args[i] in ("--dev-bind", "--ro-dev-bind") && startswith(args[i+2], r"/usr|/etc")]
             @test dests == ["/etc", "/etc/config", "/usr", "/usr/lib", "/usr/lib/test"]
         end
     end
@@ -322,7 +322,7 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
                 "--overlay-src", realpath(etc_dir),
                 "--overlay-src", realpath(lower),
                 "--overlay", realpath(upper), "/etc",
-                "--ro-bind", joinpath(dir, "extra.conf"), "/etc/extra.conf",
+                "--ro-dev-bind", joinpath(dir, "extra.conf"), "/etc/extra.conf",
             ]
         end
     end

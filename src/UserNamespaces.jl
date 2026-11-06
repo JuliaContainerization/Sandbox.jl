@@ -143,9 +143,9 @@ end
 function mount_operations(config::SandboxConfig)
     defaults = Pair{String,Vector{String}}[
         "/dev" => ["--tmpfs", "/dev", "mode=0755"],
-        ("/dev/$(node)" => ["--bind", "/dev/$(node)", "/dev/$(node)"]
+        ("/dev/$(node)" => ["--dev-bind", "/dev/$(node)", "/dev/$(node)"]
          for node in ("null", "zero", "full", "random", "urandom"))...,
-        "/dev/tty" => ["--bind-try", "/dev/tty", "/dev/tty"],
+        "/dev/tty" => ["--dev-bind-try", "/dev/tty", "/dev/tty"],
         "/dev/pts" => ["--devpts", "/dev/pts"],
         "/dev/ptmx" => ["--symlink", "pts/ptmx", "/dev/ptmx"],
         "/dev/fd" => ["--symlink", "/proc/self/fd", "/dev/fd"],
@@ -163,8 +163,9 @@ function mount_operations(config::SandboxConfig)
         any(m -> within(dest, m.first), mounts) || append!(ops, op)
     end
     for (dest, info) in mounts
-        flag = info.type == MountType.ReadOnly ? "--ro-bind" :
-               info.type == MountType.ReadWrite ? "--bind" :
+        # Device nodes in maps keep working, as they did before binds were nodev.
+        flag = info.type == MountType.ReadOnly ? "--ro-dev-bind" :
+               info.type == MountType.ReadWrite ? "--dev-bind" :
                info.type == MountType.Overlayed ? "--overlay" : "--ro-overlay"
         # The launcher takes an overlay's lower layers bottommost first, before the
         # topmost one, while `host_paths` lists them as overlayfs does: topmost first.
