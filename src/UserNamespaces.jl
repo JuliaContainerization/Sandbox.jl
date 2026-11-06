@@ -223,35 +223,31 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
         append!(cmd_string, ["--hostname", config.hostname])
     end
 
-    # If we're running in privileged mode, we need to add `sudo` (or `su`, if `sudo` doesn't exist)
-    if isa(exe, PrivilegedUserNamespacesExecutor)
-        # Next, prefer `sudo`, but allow fallback to `su`. Also, force-set our
-        # environmental mappings with sudo, because many of these are often  lost
-        # and forgotten due to `sudo` restrictions on setting `LD_LIBRARY_PATH`, etc...
-        if get(sudo_cmd(), 1, "") == "sudo"
-            sudo_envs = vcat([["-E", "$k=$(config.env[k])"] for k in keys(config.env)]...)
-            if user_cmd.env !== nothing
-                append!(sudo_envs, vcat([["-E", pair] for pair in user_cmd.env]...))
-            end
-            prepend!(cmd_string, String[sudo_cmd()..., sudo_envs...])
-        else
-            prepend!(cmd_string, sudo_cmd())
-        end
-    end
-
     # Finally, append the user-requested command string
     push!(cmd_string, "--")
     append!(cmd_string, user_cmd.exec)
 
-    # Construct a `Cmd` object off of those, with the SandboxConfig's env (if this is an unprivileged runner):
-    sandbox_cmd = setenv(Cmd(cmd_string), String[])
-    if isa(exe, UnprivilegedUserNamespacesExecutor)
-        sandbox_cmd = setenv(sandbox_cmd, config.env)
+    # The sandboxed command gets the SandboxConfig's env, overridden by the user command's
+    env = setenv(``, config.env)
+    if user_cmd.env !== nothing
+        env = addenv(env, user_cmd.env)
+    end
+    env = env.env
 
-        # If the user has provided an environment with their command, merge that in as well
-        if user_cmd.env !== nothing
-            sandbox_cmd = addenv(sandbox_cmd, user_cmd.env)
+    # In privileged mode, run the sandbox through `sudo` (or `su`, if `sudo` doesn't exist)
+    if isa(exe, PrivilegedUserNamespacesExecutor) && !isempty(sudo_cmd())
+        if get(sudo_cmd(), 1, "") == "sudo"
+            # sudo adds variables of its own (`HOME`, `USER`, `SUDO_*`, ...), and sudo-rs
+            # doesn't support `-E`, so set the environment with `env -i` instead. The sandbox
+            # reads the caller's IDs from `SUDO_UID` and `SUDO_GID`, and unsets them.
+            prepend!(cmd_string, String[sudo_cmd()..., "/usr/bin/env", "-i", "--", env...,
+                                        "SUDO_UID=$(getuid())", "SUDO_GID=$(getgid())"])
+        else
+            prepend!(cmd_string, sudo_cmd())
         end
+        sandbox_cmd = setenv(Cmd(cmd_string), String[])
+    else
+        sandbox_cmd = setenv(Cmd(cmd_string), env)
     end
 
     # If the user has asked that this command be allowed to fail silently, pass that on

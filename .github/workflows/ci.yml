@@ -37,6 +37,10 @@ jobs:
           - version: '1'
             os: 'ubuntu-24.04-arm'
             sandbox: 'jll'
+          # sudo is sudo-rs here
+          - version: '1'
+            os: 'ubuntu-26.04'
+            sandbox: 'local'
     steps:
       # Ubuntu restricts unprivileged user namespaces through AppArmor
       - name: Allow unprivileged user namespaces
