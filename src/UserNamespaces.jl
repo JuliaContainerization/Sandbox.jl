@@ -138,6 +138,40 @@ function check_overlayfs_loaded(;verbose::Bool = false)
     return true
 end
 
+# The launcher's mount operations for the sandbox's /dev, /sys and cgroup view, then for
+# `config.mounts`, parents before their children.  A mount replaces the defaults at or
+# below its destination.
+function mount_operations(config::SandboxConfig)
+    defaults = Pair{String,Vector{String}}[
+        "/dev" => ["--tmpfs", "/dev", "mode=0755"],
+        ("/dev/$(node)" => ["--bind", "/dev/$(node)", "/dev/$(node)"]
+         for node in ("null", "zero", "full", "random", "urandom"))...,
+        "/dev/tty" => ["--bind-try", "/dev/tty", "/dev/tty"],
+        "/dev/pts" => ["--devpts", "/dev/pts"],
+        "/dev/ptmx" => ["--symlink", "pts/ptmx", "/dev/ptmx"],
+        "/dev/fd" => ["--symlink", "/proc/self/fd", "/dev/fd"],
+        ("/dev/$(name)" => ["--symlink", "/proc/self/fd/$(fd)", "/dev/$(name)"]
+         for (fd, name) in zip(0:2, ("stdin", "stdout", "stderr")))...,
+        "/dev/shm" => ["--tmpfs", "/dev/shm",
+                       config.shm_size === nothing ? "mode=1777" : "mode=1777,size=$(config.shm_size)"],
+        "/sys" => ["--ro-bind", "/sys", "/sys"],
+        "/sys/fs/cgroup" => ["--cgroup", "/sys/fs/cgroup"],
+    ]
+    mounts = sort([m for m in config.mounts if m.first != "/"]; by=m -> splitpath(m.first))
+    within(path, dir) = splitpath(path)[1:min(end, length(splitpath(dir)))] == splitpath(dir)
+    ops = String[]
+    for (dest, op) in defaults
+        any(m -> within(dest, m.first), mounts) || append!(ops, op)
+    end
+    for (dest, info) in mounts
+        flag = info.type == MountType.ReadOnly ? "--ro-bind" :
+               info.type == MountType.ReadWrite ? "--bind" :
+               info.type == MountType.Overlayed ? "--overlay" : "--ro-overlay"
+        append!(ops, [flag, info.host_path, dest])
+    end
+    return ops
+end
+
 function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConfig, user_cmd::Base.CmdRedirect)
     return Base.CmdRedirect(build_executor_command(exe, config, user_cmd.cmd), user_cmd.handle, user_cmd.stream_no, user_cmd.readable)
 end
@@ -147,7 +181,7 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
     # `Cmd` object that has all of the `PATH` and `LD_LIBRARY_PATH` environment variables
     # set properly so that the executable product can be run, we are careful to ensure
     # that `sandbox` has no dependencies (as much as that is possible).
-    cmd_string = String[UserNSSandbox_jll.sandbox_path]
+    cmd_string = String[UserNSSandbox_jll.sandbox_path, "--protocol", "3"]
 
     # Enable verbose mode on the sandbox wrapper itself
     if config.verbose
@@ -159,33 +193,6 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
 
     # Add our `--cd` command
     append!(cmd_string, ["--cd", config.pwd])
-
-    # Add in read-only mappings (skipping the rootfs)
-    # Sort mounts by path length (longest first) because userns processes mounts back to front
-    sorted_mounts = sort(collect(config.mounts), by=x->length(x[1]), rev=true)
-    for (sandbox_path, mount_info) in sorted_mounts
-        if sandbox_path == "/"
-            continue
-        end
-        local mount_type_str
-        if mount_info.type == MountType.ReadOnly
-            mount_type_str = ":ro"
-        elseif mount_info.type == MountType.ReadWrite
-            mount_type_str = ":rw"
-        elseif mount_info.type == MountType.Overlayed
-            mount_type_str = ":ov"
-        elseif mount_info.type == MountType.OverlayedReadOnly
-            mount_type_str = ":rov"
-        else
-            throw(ArgumentError("Unknown mount type: $(mount_info.type)"))
-        end
-        append!(cmd_string, ["--mount", "$(mount_info.host_path):$(sandbox_path)$(mount_type_str)"])
-    end
-
-    # Add in entrypoint, if it is set
-    if config.entrypoint !== nothing
-        append!(cmd_string, ["--entrypoint", config.entrypoint])
-    end
 
     # If we have a `--persist` argument, check to see if we already have a persistence_dir
     # setup, if we do not, create a temporary directory and set it into our executor
@@ -218,16 +225,15 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
         append!(cmd_string, ["--tmpfs-size", config.tmpfs_size])
     end
 
-    if config.shm_size !== nothing
-        append!(cmd_string, ["--shm-size", config.shm_size])
-    end
-
     if config.hostname !== nothing
         append!(cmd_string, ["--hostname", config.hostname])
     end
 
+    append!(cmd_string, mount_operations(config))
+
     # Finally, append the user-requested command string
     push!(cmd_string, "--")
+    config.entrypoint === nothing || push!(cmd_string, config.entrypoint)
     append!(cmd_string, user_cmd.exec)
 
     # The sandboxed command gets the SandboxConfig's env, overridden by the user command's

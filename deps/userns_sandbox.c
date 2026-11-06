@@ -2,69 +2,70 @@
 #define _GNU_SOURCE
 
 /*
-  sandbox.c - Sandbox execution platform
+  userns_sandbox: runs a command in a sandbox made of a rootfs and an ordered list of
+  mount operations.
 
-This file serves as the entrypoint into our sandboxed/virtualized execution environment for
-BinaryBuilder.jl; it has two execution modes:
+    userns_sandbox --protocol 3 [OPTION...] [OPERATION...] -- COMMAND [ARG...]
 
-  1) Unprivileged container mode.
-  2) Privileged container mode.
+  The rootfs is mounted as an overlay, whose changes go to the `--persist` directory, or
+  to a tmpfs that is gone when the sandbox exits.  A procfs for the sandbox's PID
+  namespace goes on /proc.  Then the operations run in the order given, each on a
+  destination in that root: destinations are resolved as if the root were `/`, so that
+  symlinks in the rootfs can't lead out of it, and what is missing of them is created.
+  Finally, the mounts are locked in a nested user namespace, and the command runs as the
+  child of an init of its own PID namespace.
 
-The two modes do similar things, but in different orders and with different privileges. Eventually,
-all modes seek the same result; to run a user program with the base root fs and any other shards
-requested by the user within the BinaryBuilder.jl execution environment:
+  Unprivileged mode (the default) sets all of this up in a new user namespace.  When
+  the kernel doesn't allow mounting an overlayfs in a user namespace, the mounts can be
+  made as real root instead (privileged mode), before the sandbox drops to the calling
+  user.
 
-* Unprivileged container mode is the "normal" mode of execution; it attempts to use the native
-kernel namespace abilities to setup its environment without ever needing to be `root`. It does this
-by creating a user namespace, then using its root privileges within the namespace to mount the
-necesary shards, `chroot`, etc... within the right places in the new mount namespace created within
-the container.
+  To try it out:
 
-* Privileged container mode is what happens when `sandbox` is invoked with EUID == 0.  In this
-mode, the mounts and chroots and whatnot are performed _before_ creating a new user namespace.
-This is used as a workaround for kernels that do not have the capabilities for creating mounts
-within user namespaces.  Arch Linux is a great example of this.
-
-To test this executable, compile it with:
-
-    gcc -O2 -static -static-libgcc -std=c99 -o /tmp/sandbox ./userns_sandbox.c
-
-Then run it, mounting in a rootfs with a workspace and no other read-only maps:
-
+    make -C deps
     mkdir -p /tmp/workspace
-    /tmp/sandbox --verbose --rootfs $rootfs_dir --mount /tmp/workspace:/workspace --cd /workspace /bin/bash
+    deps/userns_sandbox --protocol 3 --verbose --rootfs $rootfs_dir \
+        --bind /tmp/workspace /workspace --cd /workspace -- /bin/bash
 */
 
 #include "userns_common.h"
 #include <grp.h>
+#include <stdarg.h>
 
-// sandbox_root is the location of the rootfs on disk.  This is required.
-char *sandbox_root = NULL;
+/* The version of the command line.  Callers pass it first, so that a launcher that
+   doesn't speak their protocol refuses to run instead of misreading them. */
+#define PROTOCOL "3"
 
-// new_cd is where we will cd to once we start running.
-char *new_cd = NULL;
+enum op_type {
+  OP_BIND,
+  OP_OVERLAY,
+  OP_TMPFS,
+  OP_DEVPTS,
+  OP_CGROUP,
+  OP_SYMLINK,
+};
+#define OP_RO 1
+#define OP_TRY 2
 
-// persist_dir is where we will store overlayfs data.
-// Specifying this will allow subsequent invocations to persist temporary state.
-char * persist_dir = NULL;
-
-enum {
-  MOUNT_TYPE_READWRITE,
-  MOUNT_TYPE_READONLY,
-  MOUNT_TYPE_OVERLAYED,
-  MOUNT_TYPE_OVERLAYED_READONLY,
+struct op {
+  int type, flags;
+  // BIND and OVERLAY: the host path; TMPFS: the mount options; SYMLINK: the target
+  const char *arg;
+  const char *dest;
+  // BIND and OVERLAY: `arg`, opened before anything is mounted; -1 for a missing
+  // optional source
+  int src_fd;
 };
 
-// Linked list of volume mappings
-struct mount_list {
-    char *mount_point;
-    char *outside_path;
-    int type;
-    struct mount_list *prev;
-};
-struct mount_list *mounts;
+static struct op *ops = NULL;
+static int n_ops = 0;
 
-// This keeps track of our execution mode
+static const char *sandbox_root = NULL;
+static const char *new_cd = NULL;
+static const char *persist_dir = NULL;
+static const char *hostname = NULL;
+static const char *tmpfs_size = NULL;
+
 enum {
   UNPRIVILEGED_CONTAINER_MODE,
   PRIVILEGED_CONTAINER_MODE,
@@ -74,56 +75,429 @@ static int execution_mode;
 // Whether we should mount our overlay with the `userxattr` option
 static int userxattr = 0;
 
+// Device nodes and setuid/setgid bits in the image must not take effect.  Mounts made
+// in a user namespace other than the initial one ignore device nodes anyway, but in
+// privileged mode we mount as real root.
+static const unsigned long overlay_flags = MS_NODEV | MS_NOSUID;
+
+
+/**** Command line ****/
+
+static void print_help() {
+  fputs(
+    "Usage: userns_sandbox --protocol " PROTOCOL " [OPTION...] [OPERATION...] -- COMMAND [ARG...]\n"
+    "\n"
+    "Options:\n"
+    "  --rootfs DIR              the root of the sandbox (required)\n"
+    "  --persist DIR             keep the changes to the rootfs and overlays in DIR\n"
+    "  --userxattr               mount the overlays with the userxattr option\n"
+    "  --tmpfs-size SIZE         size of the tmpfs that holds the changes without --persist\n"
+    "  --uid UID, --gid GID      the sandbox's user and group (default 0)\n"
+    "  --hostname NAME           the sandbox's hostname\n"
+    "  --cd DIR                  the command's working directory, created if missing\n"
+    "  --verbose                 tell what is being set up\n"
+    "\n"
+    "Operations, run in the order given, after /proc is mounted:\n"
+    "  --bind SRC DEST           bind the host path SRC at DEST, recursively\n"
+    "  --ro-bind SRC DEST        the same, read-only including the mounts below it\n"
+    "  --bind-try SRC DEST, --ro-bind-try SRC DEST\n"
+    "                            the same, skipped if SRC doesn't exist\n"
+    "  --overlay SRC DEST        an overlay of the host directory SRC at DEST, whose\n"
+    "                            changes go with those of the rootfs\n"
+    "  --ro-overlay SRC DEST     the same, read-only, which shows the changes made\n"
+    "                            through an earlier --overlay at DEST\n"
+    "  --tmpfs DEST OPTIONS      a tmpfs, with OPTIONS such as \"mode=1777,size=1G\"\n"
+    "  --devpts DEST             a new instance of devpts\n"
+    "  --cgroup DEST             a read-only view of the sandbox's cgroup\n"
+    "  --symlink TARGET DEST     a symlink at DEST to TARGET\n"
+    "\n"
+    "  --version                 print the protocol version and exit\n"
+    "  --help                    print this message and exit\n",
+    stderr);
+}
+
+static void usage_error(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  fputs("ERROR: ", stderr);
+  vfprintf(stderr, fmt, ap);
+  fputs(" (see --help)\n", stderr);
+  va_end(ap);
+  exit(EXIT_SANDBOX_FAILED);
+}
+
+// The option being parsed, for messages.
+static const char *current_opt = NULL;
+
+static const char *take_arg(int *i, int argc, char **argv) {
+  if (*i + 1 >= argc || strcmp(argv[*i + 1], "--") == 0) {
+    usage_error("%s takes more arguments", current_opt);
+  }
+  return argv[++*i];
+}
+
+static void set_once(const char **var, int *i, int argc, char **argv) {
+  if (*var != NULL) {
+    usage_error("%s given more than once", current_opt);
+  }
+  *var = take_arg(i, argc, argv);
+}
+
+static id_t parse_id(const char *s, const char *what) {
+  char *end;
+  errno = 0;
+  unsigned long id = strtoul(s, &end, 10);
+  if (s[0] < '0' || s[0] > '9' || *end != '\0' || errno != 0 || id >= (id_t)-1) {
+    usage_error("invalid %s \"%s\"", what, s);
+  }
+  return (id_t)id;
+}
+
+// Whether `path` is `prefix` or below it, comparing components.
+static int path_within(const char *path, const char *prefix) {
+  for (;;) {
+    while (*path == '/') path++;
+    while (*prefix == '/') prefix++;
+    if (*prefix == '\0') {
+      return 1;
+    }
+    size_t n = strcspn(prefix, "/");
+    if (strncmp(path, prefix, n) != 0 || (path[n] != '/' && path[n] != '\0')) {
+      return 0;
+    }
+    path += n;
+    prefix += n;
+  }
+}
+
+static void add_op(int type, int flags, const char *arg, const char *dest) {
+  if (dest[0] != '/') {
+    usage_error("destination \"%s\" is not absolute", dest);
+  }
+  // The init mounts the procfs of its PID namespace over /proc after the operations,
+  // which would hide anything they put there.
+  if (path_within(dest, "/proc")) {
+    usage_error("destination \"%s\" is in /proc, which the sandbox mounts itself", dest);
+  }
+  if ((type == OP_BIND || type == OP_OVERLAY) && arg[0] != '/') {
+    usage_error("source \"%s\" is not absolute", arg);
+  }
+  for (int i = 0; type == OP_OVERLAY && i < n_ops; i++) {
+    // Each overlay keeps its changes in a directory named after its destination.
+    if (ops[i].type == OP_OVERLAY && strcmp(ops[i].dest, dest) == 0) {
+      usage_error("more than one overlay at \"%s\"", dest);
+    }
+  }
+  ops = realloc(ops, (n_ops + 1) * sizeof(*ops));
+  check(ops != NULL);
+  ops[n_ops++] = (struct op) {.type = type, .flags = flags, .arg = arg, .dest = dest, .src_fd = -1};
+}
+
+// --bind, --ro-bind, --bind-try and --ro-bind-try
+static int parse_bind(const char *opt, int *flags) {
+  *flags = 0;
+  if (strncmp(opt, "--", 2) != 0) {
+    return 0;
+  }
+  opt += 2;
+  if (strncmp(opt, "ro-", 3) == 0) {
+    *flags |= OP_RO;
+    opt += 3;
+  }
+  if (strncmp(opt, "bind", 4) != 0) {
+    return 0;
+  }
+  opt += 4;
+  if (strcmp(opt, "-try") == 0) {
+    *flags |= OP_TRY;
+  } else if (*opt != '\0') {
+    return 0;
+  }
+  return 1;
+}
+
+// Parses the arguments after `--protocol N`, returning the index of the command.
+static int parse_args(int argc, char **argv, const char **uid_arg, const char **gid_arg) {
+  int i;
+  for (i = 3; i < argc; i++) {
+    const char *opt = current_opt = argv[i];
+    int flags;
+    if (strcmp(opt, "--") == 0) {
+      i++;
+      break;
+    } else if (strcmp(opt, "--verbose") == 0) {
+      verbose = 1;
+    } else if (strcmp(opt, "--userxattr") == 0) {
+      userxattr = 1;
+    } else if (strcmp(opt, "--rootfs") == 0) {
+      set_once(&sandbox_root, &i, argc, argv);
+    } else if (strcmp(opt, "--persist") == 0) {
+      set_once(&persist_dir, &i, argc, argv);
+    } else if (strcmp(opt, "--tmpfs-size") == 0) {
+      set_once(&tmpfs_size, &i, argc, argv);
+    } else if (strcmp(opt, "--hostname") == 0) {
+      set_once(&hostname, &i, argc, argv);
+    } else if (strcmp(opt, "--cd") == 0) {
+      set_once(&new_cd, &i, argc, argv);
+    } else if (strcmp(opt, "--uid") == 0) {
+      set_once(uid_arg, &i, argc, argv);
+    } else if (strcmp(opt, "--gid") == 0) {
+      set_once(gid_arg, &i, argc, argv);
+    } else if (parse_bind(opt, &flags)) {
+      const char *src = take_arg(&i, argc, argv);
+      add_op(OP_BIND, flags, src, take_arg(&i, argc, argv));
+    } else if (strcmp(opt, "--overlay") == 0 || strcmp(opt, "--ro-overlay") == 0) {
+      const char *src = take_arg(&i, argc, argv);
+      add_op(OP_OVERLAY, opt[2] == 'r' ? OP_RO : 0, src, take_arg(&i, argc, argv));
+    } else if (strcmp(opt, "--tmpfs") == 0) {
+      const char *dest = take_arg(&i, argc, argv);
+      add_op(OP_TMPFS, 0, take_arg(&i, argc, argv), dest);
+    } else if (strcmp(opt, "--devpts") == 0) {
+      add_op(OP_DEVPTS, 0, NULL, take_arg(&i, argc, argv));
+    } else if (strcmp(opt, "--cgroup") == 0) {
+      add_op(OP_CGROUP, 0, NULL, take_arg(&i, argc, argv));
+    } else if (strcmp(opt, "--symlink") == 0) {
+      const char *target = take_arg(&i, argc, argv);
+      add_op(OP_SYMLINK, 0, target, take_arg(&i, argc, argv));
+    } else {
+      usage_error("unknown option \"%s\" (the command goes after `--`)", opt);
+    }
+  }
+  if (i >= argc) {
+    usage_error("no command given after `--`");
+  }
+  if (sandbox_root == NULL) {
+    usage_error("--rootfs is required");
+  }
+  return i;
+}
+
+
+/**** Operations ****/
 
 /*
- * We use this method to get /dev in shape.  If we're running as init, we need to
- * mount full-blown devtmpfs at /dev.  If we're just a sandbox, we only bindmount
- * /dev/{tty,null,urandom,pts,ptmx} into our root_dir.  /dev/shm is not the host's:
- * `mount_private()` mounts a fresh one from within the sandbox's IPC namespace.
+ * Opens the sources of the bind and overlay operations, before anything is mounted, so
+ * that they are the host paths the caller named rather than whatever the setup has
+ * mounted there.  This happens in the mount namespace of the sandbox: mount(2) only
+ * binds from mounts of the namespace it is called in.
  */
-static void mount_dev(int root_fd) {
-  char path[FD_PATH_SIZE];
-  int fd;
+static void open_sources() {
+  for (int i = 0; i < n_ops; i++) {
+    struct op *op = &ops[i];
+    if (op->type != OP_BIND && op->type != OP_OVERLAY) {
+      continue;
+    }
+    op->src_fd = open(op->arg, O_PATH | O_CLOEXEC | (op->type == OP_OVERLAY ? O_DIRECTORY : 0));
+    if (op->src_fd == -1 && !(errno == ENOENT && (op->flags & OP_TRY))) {
+      fprintf(stderr, "ERROR: Failed to open '%s' to mount it at '%s': %s (errno %d)\n",
+              op->arg, op->dest, strerror(errno), errno);
+      _exit(EXIT_SANDBOX_FAILED);
+    }
+  }
+}
 
-  // These are all things that should exist in the host environment, but may not
-  // We use `bind_host_node()` to bindmount them into our sandbox if they exist.
-  bind_host_node(root_fd, "/dev/null", FALSE);
-  bind_host_node(root_fd, "/dev/tty", FALSE);
-  bind_host_node(root_fd, "/dev/zero", FALSE);
-  bind_host_node(root_fd, "/dev/random", FALSE);
-  bind_host_node(root_fd, "/dev/urandom", FALSE);
+static int open_dest(int root_fd, const struct op *op, mode_t create) {
+  int fd = open_in_root_or_die(root_fd, op->dest, create);
+  check_not_root(root_fd, fd, op->dest);
+  check_not_proc(fd, op->dest);
+  return fd;
+}
 
-  // Create the mount point for `mount_private()`, which runs in the cloned child.
-  close(open_in_root_or_die(root_fd, "/dev/shm", S_IFDIR));
-
-  // Bindmount the sysfs, but make it read-only
-  bind_host_node(root_fd, "/sys", TRUE);
-
-  // /dev/pts and /dev/ptmx are more special; we actually mount a new filesystem
-  // on /dev/pts, and then bind-mount /dev/pts/ptmx to /dev/ptmx within the
-  // sandbox itself.
-  fd = open_in_root_or_die(root_fd, "/dev/pts", S_IFDIR);
+static void mount_overlay_op(int root_fd, const struct op *op, const char *work_dir,
+                             uid_t uid, gid_t gid) {
+  char lower[FD_PATH_SIZE], path[FD_PATH_SIZE], bname[PATH_MAX];
+  fd_path(lower, op->src_fd);
+  int fd = open_dest(root_fd, op, S_IFDIR);
   fd_path(path, fd);
-  check(0 == mount("devpts", path, "devpts", 0, "ptmxmode=0666"));
+  // Each overlay keeps its changes in a directory named after its destination, so that
+  // a later run sees them at the same place.
+  hashed_basename(bname, op->dest);
+  check(TRUE == mount_overlay(lower, path, bname, work_dir, userxattr, overlay_flags));
   close(fd);
 
-  fd = open_in_root_or_die(root_fd, "/dev/pts/ptmx", 0);
+  // Look the destination up again, to get the overlay rather than what it covers.
+  fd = open_in_root_or_die(root_fd, op->dest, 0);
   fd_path(path, fd);
-  bind_mount(root_fd, path, "/dev/ptmx", FALSE);
+  check(0 == fchownat(fd, "", uid, gid, AT_EMPTY_PATH));
+  if (op->flags & OP_RO) {
+    check(0 == mount("overlay", path, "overlay", MS_REMOUNT|MS_RDONLY|overlay_flags, ""));
+  }
+  close(fd);
+}
+
+static void mount_tmpfs_op(int root_fd, const struct op *op, uid_t uid, gid_t gid) {
+  char path[FD_PATH_SIZE];
+  int fd = open_dest(root_fd, op, S_IFDIR);
+  fd_path(path, fd);
+  if (verbose) {
+    fprintf(stderr, "--> Mounting tmpfs at %s (%s)\n", op->dest, op->arg);
+  }
+  if (0 != mount("tmpfs", path, "tmpfs", MS_NOSUID|MS_NODEV, op->arg)) {
+    fprintf(stderr, "ERROR: Failed to mount a tmpfs at '%s' with options '%s': %s (errno %d)\n",
+            op->dest, op->arg, strerror(errno), errno);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+  close(fd);
+  // Owned by the sandbox's user, as everything else we create, rather than by an
+  // unmapped root in privileged mode.
+  fd = open_in_root_or_die(root_fd, op->dest, 0);
+  check(0 == fchownat(fd, "", uid, gid, AT_EMPTY_PATH));
+  close(fd);
+}
+
+static void mount_devpts_op(int root_fd, const struct op *op) {
+  char path[FD_PATH_SIZE];
+  int fd = open_dest(root_fd, op, S_IFDIR);
+  fd_path(path, fd);
+  if (verbose) {
+    fprintf(stderr, "--> Mounting devpts at %s\n", op->dest);
+  }
+  check(0 == mount("devpts", path, "devpts", MS_NOSUID|MS_NOEXEC, "newinstance,ptmxmode=0666"));
   close(fd);
 }
 
 /*
- * Helper function that mounts pretty much everything:
- *   - procfs/devtmpfs/etc...
- *   - the rootfs
- *   - any other mounts, read-write, read-only, overlayed, etc...
+ * A read-only cgroup2 mount, rooted at the cgroup the sandbox was started in (the root of
+ * its cgroup namespace), so that the sandbox can read its own limits (as /proc/self/cgroup
+ * says `0::/`) but cannot reach any other cgroup.  At the default destination, it covers
+ * the host's writable hierarchy that came in with /sys.  Without a cgroup2 hierarchy on
+ * the host there is no such view to give, and an empty read-only tmpfs takes its place.
+ *
+ * The cgroup2 mount would share its superblock with the host's, which mount(2) refuses
+ * to stack on that directly (EBUSY), and the superblock is writable, so the mount cannot
+ * be asked for read-only either.  So it is mounted in a directory of a fresh tmpfs at the
+ * destination, made read-only, then moved on top of that tmpfs.
  */
-static void mount_the_world(const char * root_dir,
-                            struct mount_list * maps,
-                            uid_t uid, gid_t gid,
-                            const char * persist_dir,
-                            const char * tmpfs_size) {
+static void mount_cgroup_op(int root_fd, const struct op *op) {
+  char path[FD_PATH_SIZE], view_path[FD_PATH_SIZE];
+  const unsigned long flags = MS_NOSUID|MS_NODEV|MS_NOEXEC;
+  struct statfs host_fs;
+  int view = statfs("/sys/fs/cgroup", &host_fs) == 0 && host_fs.f_type == CGROUP2_SUPER_MAGIC;
+
+  int fd = open_dest(root_fd, op, S_IFDIR);
+  fd_path(path, fd);
+  if (verbose) {
+    fprintf(stderr, view ? "--> Mounting a read-only cgroup2 view at %s\n"
+                         : "--> No cgroup2 hierarchy on the host, mounting an empty tmpfs at %s\n",
+            op->dest);
+  }
+  check(0 == mount("tmpfs", path, "tmpfs", flags | (view ? 0 : MS_RDONLY), "size=4k,mode=0755"));
+  if (!view) {
+    close(fd);
+    return;
+  }
+
+  int tmp_fd = open_in_root_or_die(root_fd, op->dest, 0);
+  check(0 == mkdirat(tmp_fd, "view", 0700));
+  char tmp_path[FD_PATH_SIZE];
+  fd_path(tmp_path, tmp_fd);
+  check(0 == mount(NULL, tmp_path, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|flags, NULL));
+  int view_fd = openat(tmp_fd, "view", O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+  check(view_fd != -1);
+  fd_path(view_path, view_fd);
+  if (0 != mount("cgroup2", view_path, "cgroup2", flags, NULL)) {
+    fprintf(stderr, "ERROR: Failed to mount cgroup2: %s (errno %d)\n", strerror(errno), errno);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+  close(view_fd);
+  view_fd = openat(tmp_fd, "view", O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+  check(view_fd != -1);
+  fd_path(view_path, view_fd);
+  check(0 == mount(NULL, view_path, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|flags, NULL));
+  check(0 == mount(view_path, path, NULL, MS_MOVE, NULL));
+  close(view_fd);
+  close(tmp_fd);
+  close(fd);
+}
+
+/*
+ * Creates a symlink at `op->dest` to `op->arg`.  One that is already there with the same
+ * target is fine (as in a persisted rootfs); anything else there is an error.
+ */
+static void make_symlink_op(int root_fd, const struct op *op, uid_t uid, gid_t gid) {
+  char dir[PATH_MAX], target[PATH_MAX];
+  check(strlen(op->dest) < sizeof(dir));
+  strcpy(dir, op->dest);
+  char *slash = strrchr(dir, '/');
+  const char *name = slash + 1;
+  if (*name == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+    fprintf(stderr, "ERROR: Failed to create a symlink at '%s': not a file name\n", op->dest);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+  *slash = '\0';
+  if (verbose) {
+    fprintf(stderr, "--> Creating symlink %s -> %s\n", op->dest, op->arg);
+  }
+  int dir_fd = open_in_root_or_die(root_fd, dir[0] == '\0' ? "/" : dir, S_IFDIR);
+  check_not_proc(dir_fd, op->dest);
+  if (0 != symlinkat(op->arg, dir_fd, name)) {
+    int saved_errno = errno;
+    ssize_t len = saved_errno == EEXIST ? readlinkat(dir_fd, name, target, sizeof(target)) : -1;
+    if (len != (ssize_t)strlen(op->arg) || memcmp(target, op->arg, len) != 0) {
+      fprintf(stderr, "ERROR: Failed to create a symlink at '%s': %s\n", op->dest,
+              saved_errno == EEXIST ? "something else is there" : strerror(saved_errno));
+      _exit(EXIT_SANDBOX_FAILED);
+    }
+  } else {
+    check(0 == fchownat(dir_fd, name, uid, gid, AT_SYMLINK_NOFOLLOW));
+  }
+  close(dir_fd);
+}
+
+static void run_ops(int root_fd, const char *work_dir, uid_t uid, gid_t gid) {
+  for (int i = 0; i < n_ops; i++) {
+    struct op *op = &ops[i];
+    switch (op->type) {
+      case OP_BIND:
+        if (op->src_fd == -1) {
+          if (verbose) {
+            fprintf(stderr, "--> Skipping %s, as %s doesn't exist\n", op->dest, op->arg);
+          }
+        } else {
+          bind_mount(root_fd, op->src_fd, op->arg, op->dest, op->flags & OP_RO);
+        }
+        break;
+      case OP_OVERLAY:
+        mount_overlay_op(root_fd, op, work_dir, uid, gid);
+        break;
+      case OP_TMPFS:
+        mount_tmpfs_op(root_fd, op, uid, gid);
+        break;
+      case OP_DEVPTS:
+        mount_devpts_op(root_fd, op);
+        break;
+      case OP_CGROUP:
+        mount_cgroup_op(root_fd, op);
+        break;
+      case OP_SYMLINK:
+        make_symlink_op(root_fd, op, uid, gid);
+        break;
+    }
+    if (op->src_fd != -1) {
+      close(op->src_fd);
+      op->src_fd = -1;
+    }
+  }
+}
+
+/* A procfs at /proc of `root_fd`, for the PID namespace we are in. */
+static void mount_proc(int root_fd) {
+  char path[FD_PATH_SIZE];
+  int fd = open_in_root_or_die(root_fd, "/proc", S_IFDIR);
+  fd_path(path, fd);
+  if (verbose) {
+    fprintf(stderr, "--> Mounting procfs at /proc\n");
+  }
+  check(0 == mount("proc", path, "proc", MS_NOSUID|MS_NODEV|MS_NOEXEC, NULL));
+  close(fd);
+}
+
+/*
+ * Mounts the rootfs, /proc, and everything the operations ask for, in the mount namespace
+ * of the sandbox: in privileged mode, before we clone the sandbox's user namespace, and
+ * in unprivileged mode within it.  `uid` and `gid` own the root and overlays.
+ */
+static void mount_the_world(uid_t uid, gid_t gid) {
   // systemd makes `/` a shared mount, so the mount namespace we were just given
   // shares its mounts with the host's, as peers in privileged mode, and as slaves
   // otherwise (being owned by a less privileged user namespace).  Make them private:
@@ -131,110 +505,53 @@ static void mount_the_world(const char * root_dir,
   // the sandbox.
   check(0 == mount(NULL, "/", NULL, MS_PRIVATE|MS_REC, NULL));
 
-  // If `persist_dir` is specified, it represents a host directory that should
-  // be used to store our overlayfs work data.  This is where modifications to
-  // the rootfs and such will go.  Typically, these should be ephemeral (and if
-  // `persist_dir` is `NULL`, it will be mounted in a `tmpfs` so that the
-  // modifcations are lost immediately) but if `persist_dir` is given, the
-  // mounting will be done with modifications stored in that directory.
-  // The caller will be responsible for cleaning up the `work` and `upper`
-  // directories wtihin `persist_dir`, but subsequent invocations of `sandbox`
-  // with the same `--persist` argument will allow resuming execution inside of
-  // a rootfs with the previous modifications intact.
-  const char * lower_dir = root_dir;
+  open_sources();
+
+  // The changes to the rootfs and overlays go to `persist_dir`, where later runs with
+  // the same directory find them again; the caller cleans it up.  Without it, they go
+  // to a tmpfs that is gone when the last process of the sandbox exits.
+  //
+  // overlayfs needs the tmpfs to be reachable by path while it mounts, but mounted on a
+  // host directory, it would hide whatever is below that directory from the sources.
+  // So it goes over the rootfs directory itself: the rootfs is opened beforehand to be
+  // the overlay's lower layer, and the overlay then covers the tmpfs, which stays
+  // reachable for the overlay operations through `scratch_fd`.
+  const char *work_dir = persist_dir;
+  const char *lower_dir = sandbox_root;
   char lower_path[FD_PATH_SIZE], scratch_path[FD_PATH_SIZE];
   int lower_fd = -1, scratch_fd = -1;
   if (persist_dir == NULL) {
-    // Create tmpfs to store ephemeral changes.  These changes are lost once
-    // the `tmpfs` is unmounted, which occurs when all processes within the
-    // namespace exit and the mount namespace is destroyed.
-    //
-    // overlayfs needs the tmpfs to be reachable by path while it mounts, but
-    // mounted on a host directory, it would hide whatever is below that
-    // directory from the maps.  So it goes over the rootfs directory itself:
-    // the rootfs is opened beforehand to be the overlay's lower layer, and the
-    // overlay then covers the tmpfs, which stays reachable for the overlayed
-    // maps through `scratch_fd`.
     userxattr = 0;
-    lower_fd = open_root(root_dir);
+    lower_fd = open_root(sandbox_root);
     fd_path(lower_path, lower_fd);
     lower_dir = lower_path;
 
-    char options[32];
-    int n = snprintf(options, 32, "size=%s", tmpfs_size);
-    check(0 < n);
-    check(n < 31);
-    check(0 == mount("tmpfs", lower_path, "tmpfs", 0, options));
+    char options[64];
+    int n = snprintf(options, sizeof(options), "size=%s", tmpfs_size ? tmpfs_size : "1G");
+    check(0 < n && n < sizeof(options));
+    if (0 != mount("tmpfs", lower_path, "tmpfs", 0, options)) {
+      fprintf(stderr, "ERROR: Failed to mount the tmpfs for the changes to the rootfs (%s): %s (errno %d)\n",
+              options, strerror(errno), errno);
+      _exit(EXIT_SANDBOX_FAILED);
+    }
 
-    scratch_fd = open_root(root_dir);
+    scratch_fd = open_root(sandbox_root);
     fd_path(scratch_path, scratch_fd);
-    persist_dir = scratch_path;
+    work_dir = scratch_path;
   }
-
   if (verbose) {
-    fprintf(stderr, "--> Creating overlay workdir at %s\n", persist_dir);
+    fprintf(stderr, "--> Creating overlay workdir at %s\n", work_dir);
   }
-
-  // The first thing we do is create an overlay mounting `root_dir` over itself.
-  // We need to do this immediately as we may need to create mountpoints for
-  // the rest of our mounts within the rootfs, without modifying it.
-  // `root_dir` is the path to the already-mounted rootfs image, and we are
-  // mounting it as an overlay over itself, so that we can make modifications
-  // without altering the actual rootfs image.  When running in privileged mode,
-  // we're mounting before cloning, in unprivileged mode, we clone before calling
-  // this mehod at all.
-  // Device nodes and setuid/setgid bits in the image must not take effect.  Mounts
-  // made in a user namespace other than the initial one ignore device nodes anyway,
-  // but in privileged mode we mount as real root.  Bind mounts keep the flags of
-  // their source instead: the device nodes we bind from the host's /dev must keep
-  // working.
-  const unsigned long overlay_flags = MS_NODEV | MS_NOSUID;
-  check(TRUE == mount_overlay(lower_dir, root_dir, "rootfs", persist_dir, userxattr, overlay_flags));
-  int root_fd = open_root(root_dir);
+  check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, userxattr, overlay_flags));
+  int root_fd = open_root(sandbox_root);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
   // owned by "nobody" when we're inside the sandbox.
   check(0 == fchownat(root_fd, "", uid, gid, AT_EMPTY_PATH));
 
-  // Mount all of our mounts
-  struct mount_list *entry = maps;
-  while (entry != NULL) {
-    // bind-mount the outside path to the inside path,
-    // setting the bind-mount to be read-only if requested.
-    bind_mount(root_fd,
-               entry->outside_path,
-               entry->mount_point,
-               entry->type == MOUNT_TYPE_READONLY || entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY);
+  mount_proc(root_fd);
+  run_ops(root_fd, work_dir, uid, gid);
 
-    // If we're dealing with an overlayed mount, create a unique
-    // name to store the state of this mount within our `persist_dir`.
-    if (entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
-      char bname[PATH_MAX], path[FD_PATH_SIZE];
-      hashed_basename(&bname[0], entry->mount_point);
-      int fd = open_in_root_or_die(root_fd, entry->mount_point, 0);
-      fd_path(path, fd);
-      check(TRUE == mount_overlay(path, path, bname, persist_dir, userxattr, overlay_flags));
-      close(fd);
-
-      // Each mount is stacked on what the path led to before, so look it up again.
-      fd = open_in_root_or_die(root_fd, entry->mount_point, 0);
-      fd_path(path, fd);
-      check(0 == fchownat(fd, "", uid, gid, AT_EMPTY_PATH));
-
-      // If this is a "read-only" overlay mount, remount as read-only here.
-      if (entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
-        check(0 == mount("overlay", path, "overlay", MS_REMOUNT|MS_RDONLY|overlay_flags, ""));
-      }
-      close(fd);
-    }
-    entry = entry->prev;
-  }
-
-  // Mount /proc within the sandbox.
-  mount_procfs(root_dir, uid, gid);
-
-  // Mount /dev stuff
-  mount_dev(root_fd);
   close(root_fd);
   if (lower_fd != -1) {
     close(lower_fd);
@@ -242,86 +559,8 @@ static void mount_the_world(const char * root_dir,
   }
 }
 
-/*
- * Mounts that belong to the namespaces of the cloned child rather than to the host,
- * so they are made after `clone()` in both execution modes:
- *   - a fresh tmpfs on /dev/shm, private to the sandbox like its IPC namespace;
- *     its pages are charged to the memory cgroup of the processes that use them.
- *   - a read-only cgroup2 mount on /sys/fs/cgroup, rooted at the cgroup the sandbox
- *     was started in (the root of its cgroup namespace).  It covers the host's
- *     writable hierarchy that came in with /sys, so the sandbox can read its own
- *     limits (as /proc/self/cgroup says `0::/`) but cannot reach any other cgroup.
- *     On hosts without a cgroup2 hierarchy at /sys/fs/cgroup there is no such view
- *     to give, so the host's hierarchies are hidden behind an empty tmpfs instead.
- */
-static void mount_private(const char * root_dir, const char * shm_size) {
-  char path[FD_PATH_SIZE], cgroup_path[FD_PATH_SIZE];
-  char options[64];
-  int n;
 
-  int root_fd = open_root(root_dir);
-  int shm_fd = open_in_root_or_die(root_fd, "/dev/shm", 0);
-  fd_path(path, shm_fd);
-  if (shm_size != NULL) {
-    n = snprintf(options, sizeof(options), "mode=1777,size=%s", shm_size);
-  } else {
-    n = snprintf(options, sizeof(options), "mode=1777");
-  }
-  check(0 < n && n < sizeof(options));
-  if (verbose) {
-    fprintf(stderr, "--> Mounting tmpfs at %s/dev/shm (%s)\n", root_dir, options);
-  }
-  check(0 == mount("tmpfs", path, "tmpfs", MS_NOSUID|MS_NODEV, options));
-  close(shm_fd);
-
-  struct statfs cgroup_fs;
-  int cgroup_fd = open_in_root(root_fd, "/sys/fs/cgroup", 0);
-  if (cgroup_fd == -1 || fstatfs(cgroup_fd, &cgroup_fs) != 0) {
-    // No /sys/fs/cgroup on the host, so nothing to cover.
-    if (cgroup_fd != -1) {
-      close(cgroup_fd);
-    }
-    close(root_fd);
-    return;
-  }
-  fd_path(cgroup_path, cgroup_fd);
-  unsigned long cgroup_flags = MS_NOSUID|MS_NODEV|MS_NOEXEC;
-  if (cgroup_fs.f_type == CGROUP2_SUPER_MAGIC) {
-    if (verbose) {
-      fprintf(stderr, "--> Mounting cgroup2 at %s/sys/fs/cgroup (read-only)\n", root_dir);
-    }
-    // The new mount shares its superblock with the host's mount it covers, which
-    // mount(2) refuses to stack directly (EBUSY), and the superblock is writable, so
-    // it cannot be asked for read-only either.  Mount it in the scratch space of the
-    // fresh /dev/shm, make that mount read-only, then move it into place.
-    shm_fd = open_in_root_or_die(root_fd, "/dev/shm", 0);
-    check(0 == mkdirat(shm_fd, ".cgroup", 0700));
-    int staging_fd = openat(shm_fd, ".cgroup", O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
-    check(staging_fd != -1);
-    fd_path(path, staging_fd);
-    if (0 != mount("cgroup2", path, "cgroup2", cgroup_flags, NULL)) {
-      fprintf(stderr, "ERROR: Failed to mount cgroup2: %s (errno %d)\n",
-              strerror(errno), errno);
-      _exit(EXIT_SANDBOX_FAILED);
-    }
-    close(staging_fd);
-    staging_fd = openat(shm_fd, ".cgroup", O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
-    check(staging_fd != -1);
-    fd_path(path, staging_fd);
-    check(0 == mount(NULL, path, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|cgroup_flags, NULL));
-    check(0 == mount(path, cgroup_path, NULL, MS_MOVE, NULL));
-    close(staging_fd);
-    check(0 == unlinkat(shm_fd, ".cgroup", AT_REMOVEDIR));
-    close(shm_fd);
-  } else {
-    if (verbose) {
-      fprintf(stderr, "--> No cgroup2 hierarchy at %s/sys/fs/cgroup, hiding it behind an empty tmpfs\n", root_dir);
-    }
-    check(0 == mount("tmpfs", cgroup_path, "tmpfs", MS_RDONLY|cgroup_flags, "size=4k,mode=0755"));
-  }
-  close(cgroup_fd);
-  close(root_fd);
-}
+/**** Running the command ****/
 
 /*
  * Moves into a nested user namespace (with a mount namespace) that maps only our own
@@ -353,7 +592,8 @@ static void lock_sandbox() {
   // In privileged mode, `setuid()` reset our dumpability, which leaves our /proc
   // entries owned by an unmapped root and keeps us from writing our own maps.
   prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
-  configure_user_namespace(syscall(SYS_getpid), uid, gid, uid, gid);
+  // Ourselves, through /proc/self, which needs no getpid() (see `raw_fork()`).
+  configure_user_namespace(0, uid, gid, uid, gid);
 
   // The sandboxed processes run as our user in this user namespace, so while we are
   // dumpable they could open our fds (the status pipe) through /proc/1/fd of their
@@ -403,22 +643,18 @@ static void drop_supplementary_groups() {
 }
 
 /*
- * Sets up the chroot jail, then executes the target executable.
+ * Enters the root, locks the mounts, and runs the command as the child of an init of
+ * its PID namespace.
  */
-static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_argc, char **sandbox_argv, int *parent_pipe) {
+static int sandbox_main(int sandbox_argc, char **sandbox_argv, int *parent_pipe) {
   int status;
-
-  // One of the few places where we need to not use `""`, but instead expand it to `"/"`
-  if (root_dir[0] == '\0') {
-    root_dir = "/";
-  }
 
   // Use `pivot_root()` to avoid bad interaction between `chroot()` and `clone()`,
   // where we get an EPERM on nested sandboxing.
   if (verbose) {
-    fprintf(stderr, "Entering rootfs at %s\n", root_dir);
+    fprintf(stderr, "Entering rootfs at %s\n", sandbox_root);
   }
-  check(0 == chdir(root_dir));
+  check(0 == chdir(sandbox_root));
   if (syscall(SYS_pivot_root, ".", ".") == 0) {
     // Unmount `.`, which will unmount the old root, since that's the first mountpoint in this directory
     check(0 == umount2(".", MNT_DETACH));
@@ -428,7 +664,7 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
       fprintf(stderr, "--> pivot_root() succeeded and unmounted old root\n");
     }
   } else {
-    check(0 == chroot(root_dir));
+    check(0 == chroot(sandbox_root));
     if (verbose) {
       fprintf(stderr, "--> chroot() used since pivot_root() errored with: [%d] %s; locking the sandbox will fail\n", errno, strerror(errno));
     }
@@ -452,7 +688,9 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   }
 
   // Give that PID namespace its own /proc, over the (now locked) one of ours.
-  mount_procfs("", geteuid(), getegid());
+  int root_fd = open_root("/");
+  mount_proc(root_fd);
+  close(root_fd);
 
   // If we've got a directory to change to, do so, creating it if we need to
   if (new_cd) {
@@ -508,28 +746,31 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   }
 }
 
-static void print_help() {
-  fputs("Usage: sandbox --rootfs <dir> [--cd <dir>] ", stderr);
-  fputs("[--map <from>:<to>, --map <from>:<to>, ...] ", stderr);
-  fputs("[--workspace <from>:<to>, --workspace <from>:<to>, ...] ", stderr);
-  fputs("[--persist <work_dir>] ", stderr);
-  fputs("[--entrypoint <exe_path>] ", stderr);
-  fputs("[--userxattr] ", stderr);
-  fputs("[--shm-size <size>] ", stderr);
-  fputs("[--verbose] [--help] <cmd>\n", stderr);
-  fputs("\nExample:\n", stderr);
-  fputs("  mkdir -p /tmp/workspace\n", stderr);
-  fputs("  /tmp/sandbox --verbose --rootfs $rootfs_path --workspace /tmp/workspace:/workspace --cd /workspace /bin/bash\n", stderr);
-}
-
-/*
- * Let's get this party started.
- */
 int main(int sandbox_argc, char **sandbox_argv) {
   int status = 0;
   pid_t pgrp = getpgid(0);
-  char * entrypoint = NULL;
-  const char * hostname = NULL;
+
+  if (sandbox_argc == 2 && strcmp(sandbox_argv[1], "--help") == 0) {
+    print_help();
+    return 0;
+  }
+  if (sandbox_argc == 2 && strcmp(sandbox_argv[1], "--version") == 0) {
+    puts("userns_sandbox protocol " PROTOCOL);
+    return 0;
+  }
+  if (sandbox_argc < 3 || strcmp(sandbox_argv[1], "--protocol") != 0 ||
+      strcmp(sandbox_argv[2], PROTOCOL) != 0) {
+    fputs("ERROR: This sandbox speaks protocol " PROTOCOL ", and its arguments must start "
+          "with `--protocol " PROTOCOL "`\n", stderr);
+    return EXIT_SANDBOX_FAILED;
+  }
+
+  const char *uid_arg = NULL, *gid_arg = NULL;
+  int cmd_idx = parse_args(sandbox_argc, sandbox_argv, &uid_arg, &gid_arg);
+  sandbox_argv += cmd_idx;
+  sandbox_argc -= cmd_idx;
+  uid_t dst_uid = uid_arg ? parse_id(uid_arg, "uid") : 0;
+  gid_t dst_gid = gid_arg ? parse_id(gid_arg, "gid") : 0;
 
   // First, determine our execution mode based on pid and euid (allowing for override)
   const char * forced_mode = getenv("FORCE_SANDBOX_MODE");
@@ -553,6 +794,10 @@ int main(int sandbox_argc, char **sandbox_argv) {
     // since we've got mad permissions inside; so just always do that.
     setenv("FORCE_SANDBOX_MODE", "unprivileged", 0);
   }
+  if (verbose) {
+    fprintf(stderr, "verbose sandbox enabled (running in %sprivileged container mode)\n",
+            execution_mode == UNPRIVILEGED_CONTAINER_MODE ? "un" : "");
+  }
 
   uid_t uid = getuid();
   gid_t gid = getgid();
@@ -573,203 +818,6 @@ int main(int sandbox_argc, char **sandbox_argv) {
   unsetenv("SUDO_UID");
   unsetenv("SUDO_GID");
 
-  uid_t dst_uid = 0;
-  gid_t dst_gid = 0;
-
-  char * tmpfs_size = "1G"; // default value if the `--tmpfs-size` option is not provided
-  char * shm_size = NULL;   // size of /dev/shm; the tmpfs default (half of RAM) if not given
-
-  // Parse out options
-  while(1) {
-    static struct option long_options[] = {
-      {"help",       no_argument,       NULL, 'h'},
-      {"verbose",    no_argument,       NULL, 'v'},
-      {"rootfs",     required_argument, NULL, 'r'},
-      {"entrypoint", required_argument, NULL, 'e'},
-      {"persist",    required_argument, NULL, 'p'},
-      {"cd",         required_argument, NULL, 'c'},
-      {"mount",      required_argument, NULL, 'm'},
-      {"uid",        required_argument, NULL, 'u'},
-      {"gid",        required_argument, NULL, 'g'},
-      {"tmpfs-size", required_argument, NULL, 't'},
-      {"shm-size",   required_argument, NULL, 's'},
-      {"userxattr",  no_argument,       NULL, 'x'},
-      {"hostname",   required_argument, NULL, 'H'},
-      {0, 0, 0, 0}
-    };
-
-    int opt_idx;
-    int c = getopt_long(sandbox_argc, sandbox_argv, "", long_options, &opt_idx);
-
-    // End of options
-    if( c == -1 )
-      break;
-
-    switch( c ) {
-      case 'h':
-        print_help();
-        return 0;
-      case '?':
-        // getopt already printed what was wrong; an option we don't know must not
-        // look like a successful run to a caller that expected it to take effect.
-        print_help();
-        return EXIT_SANDBOX_FAILED;
-      case 'v':
-        verbose = 1;
-        fprintf(stderr, "verbose sandbox enabled (running in ");
-        switch (execution_mode) {
-          case UNPRIVILEGED_CONTAINER_MODE:
-            fprintf(stderr, "un");
-          case PRIVILEGED_CONTAINER_MODE:
-            fprintf(stderr, "privileged container");
-            break;
-        }
-        fprintf(stderr, " mode)\n");
-        break;
-      case 'r': {
-        sandbox_root = strdup(optarg);
-        size_t sandbox_root_len = strlen(sandbox_root);
-        if (sandbox_root[sandbox_root_len-1] == '/' ) {
-            sandbox_root[sandbox_root_len-1] = '\0';
-        }
-        if (verbose) {
-          fprintf(stderr, "Parsed --rootfs as \"%s\"\n", sandbox_root);
-        }
-      } break;
-      case 'c':
-        new_cd = strdup(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --cd as \"%s\"\n", new_cd);
-        }
-        break;
-      case 'm': {
-        // Find the colon in "from:to"
-        char *colon = strchr(optarg, ':');
-        if (colon == NULL) {
-          fprintf(stderr, "ERROR: --mount \"%s\" is not of the form <from>:<to>[:<type>]!\n", optarg);
-          return EXIT_SANDBOX_FAILED;
-        }
-
-        // Extract "from" and "to"
-        char *from = strndup(optarg, (colon - optarg));
-        char *to = strdup(colon + 1);
-        if (from[0] != '/') {
-          fprintf(stderr, "ERROR: Outside path \"%s\" must be absolute!\n", from);
-          return EXIT_SANDBOX_FAILED;
-        }
-
-        // Look for mount options
-        int mount_type = MOUNT_TYPE_READWRITE;
-        char *mount_str = strchr(to, ':');
-        if (mount_str != NULL) {
-          // Chop off the colon so `to` is NULL-terminated.
-          *mount_str = '\0';
-          mount_str++;
-          if (strcmp(mount_str, "ro") == 0) {
-            mount_type = MOUNT_TYPE_READONLY;
-          } else if (strcmp(mount_str, "ov") == 0) {
-            mount_type = MOUNT_TYPE_OVERLAYED;
-          } else if (strcmp(mount_str, "rov") == 0) {
-            mount_type = MOUNT_TYPE_OVERLAYED_READONLY;
-          } else if (strcmp(mount_str, "rw") == 0) {
-            mount_type = MOUNT_TYPE_READWRITE;
-          } else {
-            fprintf(stderr, "ERROR: Unknown mount type in \"%s\" -> \"%s\" with type \"%s\"!\n", from, to, mount_str);
-            return EXIT_SANDBOX_FAILED;
-          }
-        }
-
-        // Construct `mount_list` object for this `from:to:type` pair
-        struct mount_list *entry = (struct mount_list *) malloc(sizeof(struct mount_list));
-        entry->mount_point = to;
-        entry->outside_path = from;
-        entry->type = mount_type;
-        entry->prev = mounts;
-        mounts = entry;
-
-        if (verbose) {
-          fprintf(stderr, "Parsed --mount as \"%s\" -> \"%s\" (\"%s\")\n",
-                  entry->outside_path, entry->mount_point, mount_str);
-        }
-      } break;
-      case 'p':
-        persist_dir = strdup(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --persist as \"%s\"\n", persist_dir);
-        }
-        break;
-      case 'u':
-        dst_uid = atoi(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --uid as \"%d\"\n", dst_uid);
-        }
-        break;
-      case 'g':
-        dst_gid = atoi(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --gid as \"%d\"\n", dst_gid);
-        }
-        break;
-      case 'e':
-        entrypoint = strdup(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --entrypoint as \"%s\"\n", entrypoint);
-        }
-        break;
-      case 't':
-        tmpfs_size = strdup(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --tmpfs-size as \"%s\"\n", tmpfs_size);
-        }
-        break;
-      case 's':
-        shm_size = strdup(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --shm-size as \"%s\"\n", shm_size);
-        }
-        break;
-      case 'H':
-        hostname = strdup(optarg);
-        if (verbose) {
-          fprintf(stderr, "Parsed --hostname as \"%s\"\n", hostname);
-        }
-        break;
-      case 'x':
-        userxattr = 1;
-        break;
-      default:
-        fputs("getoptlong defaulted?!\n", stderr);
-        return EXIT_SANDBOX_FAILED;
-    }
-  }
-
-  // Skip past those arguments
-  sandbox_argv += optind;
-  sandbox_argc -= optind;
-
-  // If we were given an entrypoint, push that onto the front of `sandbox_argv`
-  if (entrypoint != NULL) {
-    // Yes, we clobber sandbox_argv[-1] here; but we already know that `optind` >= 2
-    // since `entrypoint != NULL`, so this is acceptable.
-    sandbox_argv -= 1;
-    sandbox_argc += 1;
-    sandbox_argv[0] = entrypoint;
-  }
-
-  // If we don't have a command, die
-  if (sandbox_argc == 0) {
-    fputs("No <cmd> given!\n", stderr);
-    print_help();
-    return EXIT_SANDBOX_FAILED;
-  }
-
-  // If we haven't been given a sandbox root, die
-  if (!sandbox_root) {
-    fputs("--rootfs is required!\n", stderr);
-    print_help();
-    return EXIT_SANDBOX_FAILED;
-  }
-
   // If we're running in one of the container modes, we're going to syscall() ourselves a
   // new, cloned process that is in a container process. We will use a pipe for synchronization.
   // The regular SIGSTOP method does not work because container-inits don't receive STOP or KILL
@@ -780,14 +828,11 @@ int main(int sandbox_argc, char **sandbox_argv) {
   check(0 == pipe2(parent_pipe, O_CLOEXEC));
 
   if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
-    // We dissociate ourselves from the typical mount namespace.  This gives us the freedom
-    // to start mounting things willy-nilly without mucking up the user's computer.
-    check(0 == unshare(CLONE_NEWNS));
-
-    // Mount the rootfs, shards, and workspace.  We do this here because, on this machine,
-    // we may not have permissions to mount overlayfs within user namespaces.
-    mount_the_world(sandbox_root, mounts, uid, gid, persist_dir, tmpfs_size);
-
+    // Mount everything as real root, in a mount namespace of our own.  The cgroup
+    // namespace is new as well, so that the cgroup view is rooted at our cgroup, as it is
+    // when mounted from within the sandbox's.
+    check(0 == unshare(CLONE_NEWNS | CLONE_NEWCGROUP));
+    mount_the_world(uid, gid);
     drop_supplementary_groups();
   }
 
@@ -827,21 +872,21 @@ int main(int sandbox_argc, char **sandbox_argv) {
       // Changing credentials disarmed the death signal.
       die_with_launcher(parent_pipe[1]);
 
-      // The /proc mountpoint previously mounted is in the wrong PID namespace;
-      // mount a new procfs over it to to get better values:
-      mount_procfs(sandbox_root, dst_uid, dst_gid);
-    } else if (execution_mode == UNPRIVILEGED_CONTAINER_MODE) {
-      // If we're in unprivileged container mode, mount the world now that we
-      // have supreme cosmic power.
-      mount_the_world(sandbox_root, mounts, dst_uid, dst_gid, persist_dir, tmpfs_size);
-    }
-    mount_private(sandbox_root, shm_size);
+      // The /proc mounted before we cloned is the host's PID namespace's.  The init's
+      // own goes on top later, but the command may unmount that one, so cover the
+      // host's with ours first.
+      int root_fd = open_root(sandbox_root);
+      mount_proc(root_fd);
+      close(root_fd);
 
-    if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
       // The rootfs was mounted before we entered this user namespace, so the kernel
       // locked it to its parent, and `pivot_root()` refuses a locked mount.  A
       // recursive bind of it made from in here is not locked itself.
       check(0 == mount(sandbox_root, sandbox_root, NULL, MS_BIND|MS_REC, NULL));
+    } else {
+      // If we're in unprivileged container mode, mount the world now that we
+      // have supreme cosmic power.
+      mount_the_world(dst_uid, dst_gid);
     }
 
     // Set the hostname, if that's been requested
@@ -850,7 +895,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
     }
 
     // Finally, we begin invocation of the target program.
-    return sandbox_main(sandbox_root, new_cd, sandbox_argc, sandbox_argv, parent_pipe);
+    return sandbox_main(sandbox_argc, sandbox_argv, parent_pipe);
   }
 
   // If we're out here, we are still the "parent" process.  The Prestige lives on.
