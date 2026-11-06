@@ -1,8 +1,8 @@
 module Sandbox
-using Preferences, Scratch, LazyArtifacts, TOML
+using Preferences, Scratch, LazyArtifacts
 
 import Base: run, success
-export SandboxExecutor, DockerExecutor, UserNamespacesExecutor, SandboxConfig,
+export SandboxExecutor, UserNamespacesExecutor, SandboxConfig,
        preferred_executor, executor_available, probe_executor, run, cleanup, with_executor
 using Base.BinaryPlatforms
 
@@ -45,18 +45,13 @@ include("binfmt_misc.jl")
 # Our SandboxConfig object, defining the environment sandboxed executions happen within
 include("SandboxConfig.jl")
 
-# Load the Docker executor
-include("Docker.jl")
-
 # Load the UserNamespace executor
 include("UserNamespaces.jl")
 
 all_executors = Type{<:SandboxExecutor}[
-    # We always prefer the UserNamespaces executor, if we can use it,
-    # and the unprivileged one most of all.  Only after that do we try `docker`.
+    # The unprivileged one most of all
     UnprivilegedUserNamespacesExecutor,
     PrivilegedUserNamespacesExecutor,
-    DockerExecutor,
 ]
 
 function select_executor(verbose::Bool)
@@ -68,8 +63,6 @@ function select_executor(verbose::Bool)
             return UnprivilegedUserNamespacesExecutor
         elseif executor ∈ ("privilegedusernamespacesexecutor", "privileged")
             return PrivilegedUserNamespacesExecutor
-        elseif executor ∈ ("dockerexecutor", "docker")
-            return DockerExecutor
         end
     end
 
@@ -80,8 +73,7 @@ function select_executor(verbose::Bool)
         end
     end
     error("""Could not find any available executors for $(triplet(HostPlatform()))!
-             On Linux this could mean user namespaces are unavailable.
-             On macOS and Windows this could mean Docker is not installed.""")
+             This could mean user namespaces are unavailable.""")
 end
 
 _preferred_executor = nothing

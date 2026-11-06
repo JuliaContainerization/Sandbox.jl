@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 
-using Sandbox, Pkg.Artifacts, Scratch, SHA, ghr_jll
+using Pkg.Artifacts, Scratch, SHA, Tar, ghr_jll
 
 if isempty(ARGS)
     println("Usage: julia --project build_docker_image.jl <dir>")
@@ -12,7 +12,15 @@ run(`docker build -t $(image_name) $(image_name)`)
 
 artifact_hash = create_artifact() do dir
     @info("Building $(image_name)")
-    Sandbox.export_docker_image(image_name, dir; verbose=true)
+    container = readchomp(`docker create $(image_name) /bin/true`)
+    try
+        open(`docker export $(container)`) do io
+            # Device nodes would need root to create, and the sandbox makes its own /dev
+            Tar.extract(hdr -> hdr.type != :chardev, io, dir)
+        end
+    finally
+        run(`docker rm -f $(container)`)
+    end
     @info("Hashing")
 end
 
