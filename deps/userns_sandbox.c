@@ -46,6 +46,7 @@ enum op_type {
 };
 #define OP_RO 1
 #define OP_TRY 2
+#define OP_DEV 4
 
 struct op {
   int type, flags;
@@ -98,9 +99,11 @@ static void print_help() {
     "  --verbose                 tell what is being set up\n"
     "\n"
     "Operations, run in the order given, after /proc is mounted:\n"
-    "  --bind SRC DEST           bind the host path SRC at DEST, recursively\n"
-    "  --ro-bind SRC DEST        the same, read-only including the mounts below it\n"
-    "  --bind-try SRC DEST, --ro-bind-try SRC DEST\n"
+    "  --bind SRC DEST           bind the host path SRC at DEST, recursively, with\n"
+    "                            device nodes and setuid bits that don't take effect\n"
+    "  --dev-bind SRC DEST       the same, where device nodes work\n"
+    "  --ro-bind, --ro-dev-bind  the same, read-only including the mounts below it\n"
+    "  --bind-try, --dev-bind-try, --ro-bind-try, --ro-dev-bind-try\n"
     "                            the same, skipped if SRC doesn't exist\n"
     "  --overlay SRC DEST        an overlay of the host directory SRC at DEST, whose\n"
     "                            changes go with those of the rootfs\n"
@@ -193,7 +196,7 @@ static void add_op(int type, int flags, const char *arg, const char *dest) {
   ops[n_ops++] = (struct op) {.type = type, .flags = flags, .arg = arg, .dest = dest, .src_fd = -1};
 }
 
-// --bind, --ro-bind, --bind-try and --ro-bind-try
+// --[ro-][dev-]bind[-try]
 static int parse_bind(const char *opt, int *flags) {
   *flags = 0;
   if (strncmp(opt, "--", 2) != 0) {
@@ -203,6 +206,10 @@ static int parse_bind(const char *opt, int *flags) {
   if (strncmp(opt, "ro-", 3) == 0) {
     *flags |= OP_RO;
     opt += 3;
+  }
+  if (strncmp(opt, "dev-", 4) == 0) {
+    *flags |= OP_DEV;
+    opt += 4;
   }
   if (strncmp(opt, "bind", 4) != 0) {
     return 0;
@@ -454,7 +461,10 @@ static void run_ops(int root_fd, const char *work_dir, uid_t uid, gid_t gid) {
             fprintf(stderr, "--> Skipping %s, as %s doesn't exist\n", op->dest, op->arg);
           }
         } else {
-          bind_mount(root_fd, op->src_fd, op->arg, op->dest, op->flags & OP_RO);
+          // Setuid bits never take effect, and device nodes only with dev-, whatever
+          // the source's mount allows.
+          bind_mount(root_fd, op->src_fd, op->arg, op->dest,
+                     MS_NOSUID | (op->flags & OP_DEV ? 0 : MS_NODEV) | (op->flags & OP_RO ? MS_RDONLY : 0));
         }
         break;
       case OP_OVERLAY:
