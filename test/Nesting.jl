@@ -44,107 +44,118 @@ end
             continue
         end
 
-        @testset "$(executor) Nesting" begin
-            pkgdir = dirname(@__DIR__)
-            mktempdir() do dir
-                # Directory to hold read-writing from nested sandboxen
-                rw_dir = joinpath(dir, "rw")
-                mkpath(rw_dir)
-                mkpath(joinpath(rw_dir, "home"))
+        # Also nest as root: a sandbox started as root without `FORCE_SANDBOX_MODE`
+        # runs in privileged mode, as BinaryBuilder's does inside a sandbox (its runner
+        # replaces the environment). Only our own executor lets us pick the uid.
+        uids = [Sandbox.getuid()]
+        if executor <: UnprivilegedUserNamespacesExecutor
+            push!(uids, 0)
+        end
+        unique!(uids)
 
-                # Directory to hold sandbox persistence data
-                persist_dir = mktempdir(first(Sandbox.find_persist_dir_root(rootfs_dir)))
+        for uid in uids
+            @testset "$(executor) Nesting (uid $(uid))" begin
+                pkgdir = dirname(@__DIR__)
+                mktempdir() do dir
+                    # Directory to hold read-writing from nested sandboxen
+                    rw_dir = joinpath(dir, "rw")
+                    mkpath(rw_dir)
+                    mkpath(joinpath(rw_dir, "home"))
 
-                ro_mappings = Dict(
-                    # Mount in the rootfs
-                    "/" => rootfs_dir,
-                    # Mount our package in at its own location
-                    pkgdir => pkgdir,
-                    # Mount our current active project, which may contain a local
-                    # preferences file with a custom sandbox path.
-                    "/project" => dirname(Base.active_project()),
-                    # Mount in a Julia that can run in this sandbox
-                    "/usr/local/julia" => get_nestable_julia(),
-                )
+                    # Directory to hold sandbox persistence data
+                    persist_dir = mktempdir(first(Sandbox.find_persist_dir_root(rootfs_dir)))
 
-                # On the off-chance that we're using a custom `sandbox`,
-                # make sure it's available at the path that the project will expect
-                if UserNSSandbox_jll.is_available()
-                    sandbox_path = dirname(Sandbox.UserNSSandbox_jll.sandbox_path)
-                    ro_mappings[sandbox_path] = sandbox_path
-                end
-
-                # Mount in `/etc/resolv.conf` as a read-only mount if using a UserNS executor, so that we have DNS
-                if executor <: UserNamespacesExecutor && isfile("/etc/resolv.conf")
-                    resolv_conf = joinpath(rw_dir, "resolv.conf")
-                    cp("/etc/resolv.conf", resolv_conf; follow_symlinks=true)
-                    ro_mappings["/etc/resolv.conf"] = resolv_conf
-                end
-
-                # read-write mappings
-                rw_mappings = Dict(
-                    # Mount a temporary directory in as writable
-                    "/tmp/readwrite" => rw_dir,
-                    # Mount a directory to hold our persistent sandbox data
-                    "/sandbox_persistence" => persist_dir,
-                )
-
-                # Build environment mappings
-                env = Dict(
-                    "PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin",
-                    "HOME" => "/tmp/readwrite/home",
-                    # Because overlayfs nesting with persistence requires mounting an overlayfs with
-                    # a non-tmpfs-hosted workdir, and that's illegal on top of another overlayfs, we
-                    # need to thread our persistence mappings through to the client.  We do so by
-                    # bind-mounting `/sandbox_persistence` into the sandbox for future recursive mountings
-                    "SANDBOX_PERSISTENCE_DIR" => "/sandbox_persistence",
-                )
-                # If we're a nested sandbox, pass the forcing through
-                if haskey(ENV, "FORCE_SANDBOX_MODE")
-                    env["FORCE_SANDBOX_MODE"] = ENV["FORCE_SANDBOX_MODE"]
-                end
-
-                config = SandboxConfig(
-                    ro_mappings,
-                    rw_mappings,
-                    env;
-                    pwd = pkgdir,
-                    uid = Sandbox.getuid(),
-                    gid = Sandbox.getgid(),
-                )
-
-                cmd = `/bin/sh -c "julia --color=yes test/nested/nested_child.jl"`
-                with_executor(executor) do exe
-                    @test success(exe, config, cmd)
-                end
-                @test isfile(joinpath(rw_dir, "single_nested.txt"))
-                @test isfile(joinpath(rw_dir, "double_nested.txt"))
-                @test String(read(joinpath(rw_dir, "single_nested.txt"))) == "aperture\n"
-                @test String(read(joinpath(rw_dir, "double_nested.txt"))) == "science\n"
-
-                if executor <: DockerExecutor
-                    stderr = IOBuffer()
-                    config_with_stderr = SandboxConfig(
-                        ro_mappings,
-                        # Mount a temporary directory in as writable
-                        Dict("/tmp/readwrite" => rw_dir),
-                        # Add the path to `julia` onto the path
-                        Dict(
-                            "PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin",
-                            "HOME" => "/tmp/readwrite/home",
-                        );
-                        pwd = pkgdir,
-                        uid = Sandbox.getuid(),
-                        gid = Sandbox.getgid(),
-                        stderr = stderr,
-                        persist = false,
+                    ro_mappings = Dict(
+                        # Mount in the rootfs
+                        "/" => rootfs_dir,
+                        # Mount our package in at its own location
+                        pkgdir => pkgdir,
+                        # Mount our current active project, which may contain a local
+                        # preferences file with a custom sandbox path.
+                        "/project" => dirname(Base.active_project()),
+                        # Mount in a Julia that can run in this sandbox
+                        "/usr/local/julia" => get_nestable_julia(),
                     )
 
-                    for privileges in [:no_new_privileges, :unprivileged]
-                        with_executor(executor; privileges) do exe
-                            @test !success(exe, config_with_stderr, cmd)
-                            # Ensure that we get the nested sandbox unable to run any nested sandboxing
-                            @test occursin("Could not find any available executors", String(take!(stderr)))
+                    # On the off-chance that we're using a custom `sandbox`,
+                    # make sure it's available at the path that the project will expect
+                    if UserNSSandbox_jll.is_available()
+                        sandbox_path = dirname(Sandbox.UserNSSandbox_jll.sandbox_path)
+                        ro_mappings[sandbox_path] = sandbox_path
+                    end
+
+                    # Mount in `/etc/resolv.conf` as a read-only mount if using a UserNS executor, so that we have DNS
+                    if executor <: UserNamespacesExecutor && isfile("/etc/resolv.conf")
+                        resolv_conf = joinpath(rw_dir, "resolv.conf")
+                        cp("/etc/resolv.conf", resolv_conf; follow_symlinks=true)
+                        ro_mappings["/etc/resolv.conf"] = resolv_conf
+                    end
+
+                    # read-write mappings
+                    rw_mappings = Dict(
+                        # Mount a temporary directory in as writable
+                        "/tmp/readwrite" => rw_dir,
+                        # Mount a directory to hold our persistent sandbox data
+                        "/sandbox_persistence" => persist_dir,
+                    )
+
+                    # Build environment mappings
+                    env = Dict(
+                        "PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin",
+                        "HOME" => "/tmp/readwrite/home",
+                        # Because overlayfs nesting with persistence requires mounting an overlayfs with
+                        # a non-tmpfs-hosted workdir, and that's illegal on top of another overlayfs, we
+                        # need to thread our persistence mappings through to the client.  We do so by
+                        # bind-mounting `/sandbox_persistence` into the sandbox for future recursive mountings
+                        "SANDBOX_PERSISTENCE_DIR" => "/sandbox_persistence",
+                    )
+                    # If we're a nested sandbox, pass the forcing through
+                    if haskey(ENV, "FORCE_SANDBOX_MODE")
+                        env["FORCE_SANDBOX_MODE"] = ENV["FORCE_SANDBOX_MODE"]
+                    end
+
+                    config = SandboxConfig(
+                        ro_mappings,
+                        rw_mappings,
+                        env;
+                        pwd = pkgdir,
+                        uid,
+                        gid = uid == 0 ? 0 : Sandbox.getgid(),
+                    )
+
+                    cmd = `/bin/sh -c "julia --color=yes test/nested/nested_child.jl"`
+                    with_executor(executor) do exe
+                        @test success(exe, config, cmd)
+                    end
+                    @test isfile(joinpath(rw_dir, "single_nested.txt"))
+                    @test isfile(joinpath(rw_dir, "double_nested.txt"))
+                    @test String(read(joinpath(rw_dir, "single_nested.txt"))) == "aperture\n"
+                    @test String(read(joinpath(rw_dir, "double_nested.txt"))) == "science\n"
+
+                    if executor <: DockerExecutor
+                        stderr = IOBuffer()
+                        config_with_stderr = SandboxConfig(
+                            ro_mappings,
+                            # Mount a temporary directory in as writable
+                            Dict("/tmp/readwrite" => rw_dir),
+                            # Add the path to `julia` onto the path
+                            Dict(
+                                "PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin",
+                                "HOME" => "/tmp/readwrite/home",
+                            );
+                            pwd = pkgdir,
+                            uid = Sandbox.getuid(),
+                            gid = Sandbox.getgid(),
+                            stderr = stderr,
+                            persist = false,
+                        )
+
+                        for privileges in [:no_new_privileges, :unprivileged]
+                            with_executor(executor; privileges) do exe
+                                @test !success(exe, config_with_stderr, cmd)
+                                # Ensure that we get the nested sandbox unable to run any nested sandboxing
+                                @test occursin("Could not find any available executors", String(take!(stderr)))
+                            end
                         end
                     end
                 end

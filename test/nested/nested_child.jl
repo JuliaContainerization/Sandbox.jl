@@ -20,6 +20,7 @@ using Sandbox, Test
 
 rootfs_dir = Sandbox.debian_rootfs()
 
+inner_stderr = IOBuffer()
 config = SandboxConfig(
     # This rootfs was downloaded within the sandbox in the `Pkg.instantiate()` above
     Dict("/" => rootfs_dir),
@@ -27,6 +28,7 @@ config = SandboxConfig(
     Dict{String,String}("/tmp/readwrite" => "/tmp/readwrite"),
     persist=true,
     verbose=true,
+    stderr=inner_stderr,
 )
 
 # Prove that we can write into the `readwrite` location
@@ -42,3 +44,11 @@ with_executor() do exe
     @test success(exe, config, `/bin/sh -c "echo science > /tmp/readwrite/double_nested.txt"`)
 end
 @test String(read("/tmp/readwrite/double_nested.txt")) == "science\n"
+
+# The sandbox binary picks its mode from its own euid, as `FORCE_SANDBOX_MODE` is not in
+# the nested sandbox's environment: started as root, it runs privileged, mounting the
+# rootfs before creating its user namespace and a procfs for its PID namespace after.
+inner_log = String(take!(inner_stderr))
+print(stderr, inner_log)
+mode = Sandbox.getuid() == 0 ? "privileged" : "unprivileged"
+@test occursin("running in $(mode) container mode", inner_log)
