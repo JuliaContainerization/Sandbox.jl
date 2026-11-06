@@ -44,9 +44,8 @@ end
             continue
         end
 
-        # Also nest as root: a sandbox started as root without `FORCE_SANDBOX_MODE`
-        # runs in privileged mode, as BinaryBuilder's does inside a sandbox (its runner
-        # replaces the environment). Only our own executor lets us pick the uid.
+        # Also nest as root, as BinaryBuilder's runner does.  Only our own executor lets
+        # us pick the uid.
         uids = [Sandbox.getuid()]
         if executor <: UnprivilegedUserNamespacesExecutor
             push!(uids, 0)

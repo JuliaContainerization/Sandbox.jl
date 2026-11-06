@@ -11,9 +11,10 @@ end
 function launcher_cmd(mode, args; env=String[])
     exe = UserNSSandbox_jll.sandbox_path
     if mode == :sudo
-        return `sudo -n /usr/bin/env -i PATH=/usr/bin:/bin $(env) SUDO_UID=$(Sandbox.getuid()) SUDO_GID=$(Sandbox.getgid()) FORCE_SANDBOX_MODE=privileged $(exe) $(args)`
+        args = `$(args[1:2]) --privileged $(args[3:end])`
+        return `sudo -n /usr/bin/env -i PATH=/usr/bin:/bin $(env) SUDO_UID=$(Sandbox.getuid()) SUDO_GID=$(Sandbox.getgid()) $(exe) $(args)`
     end
-    return setenv(`$(exe) $(args)`, ["PATH=/usr/bin:/bin", "FORCE_SANDBOX_MODE=unprivileged"; env])
+    return setenv(`$(exe) $(args)`, ["PATH=/usr/bin:/bin"; env])
 end
 
 # Runs `script` in a sandbox of the debian rootfs with the operations `ops`, returning

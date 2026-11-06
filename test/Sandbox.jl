@@ -102,7 +102,6 @@ for executor in all_executors
                 with_executor(executor) do exe
                     @test success(exe, config, user_cmd)
                     @test sort(split(String(take!(stdout)), '\n'; keepempty=false)) == [
-                        "FORCE_SANDBOX_MODE=unprivileged",  # set by the sandbox, for nesting
                         "LD_LIBRARY_PATH=science",
                         "PATH=/usr/bin:/bin",
                         "SHELL=friend",
