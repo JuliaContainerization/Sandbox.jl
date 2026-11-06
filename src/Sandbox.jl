@@ -1,5 +1,5 @@
 module Sandbox
-using Preferences, Scratch, LazyArtifacts, TOML, Libdl
+using Preferences, Scratch, LazyArtifacts, TOML
 
 import Base: run, success
 export SandboxExecutor, DockerExecutor, UserNamespacesExecutor, SandboxConfig,
