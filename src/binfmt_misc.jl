@@ -153,7 +153,7 @@ silently ignored.
 """
 function read_binfmt_misc_registrations()
     if !check_binfmt_misc_loaded()
-        return String[]
+        return BinFmtRegistration[]
     end
 
     registrations = BinFmtRegistration[]
@@ -178,7 +178,7 @@ function read_binfmt_misc_registrations()
     return registrations
 end
 
-sudo_tee(f::Function, path::String) = open(f, Cmd([sudo_cmd()..., "tee", "-a", path]), write=true)
+sudo_tee(f::Function, path::String) = open(f, `sudo tee -a $(path)`, write=true)
 
 """
     write_binfmt_misc_registration(reg::BinFmtRegistration)
@@ -266,7 +266,7 @@ end
 ## binfmt_misc registration templates for various architectures.
 ## Note that these are true no matter the host architecture; e.g. these
 ## can just as easily point at `x86_64-qemu-aarch64-static` as `ppc64le-qemu-aarch64-static`.
-## In fact, the interpreter path typically gets overwritten in `build_executor_command` anyway.
+## In fact, `register_requested_formats!` replaces the interpreter path with an artifact's.
 const qemu_x86_64 = BinFmtRegistration(
     "qemu-x86_64",
     "/usr/bin/qemu-x86_64-static",
@@ -336,3 +336,25 @@ function natively_runnable(p::Platform)
     =#
     return host_arch == arch(p)
 end
+
+# The registrations that running executables of `platforms` needs.
+function multiarch_formats(platforms::AbstractVector{<:Platform})
+    formats = Set{BinFmtRegistration}()
+    interp_platforms = collect(keys(platform_qemu_registrations))
+    for platform in platforms
+        Sys.islinux(platform) || throw(ArgumentError("Platform $(triplet(platform)) is not Linux"))
+        natively_runnable(platform) && continue
+        idx = findfirst(p -> platforms_match(platform, p), interp_platforms)
+        idx === nothing && throw(ArgumentError("Platform $(triplet(platform)) unsupported for multiarch!"))
+        push!(formats, platform_qemu_registrations[interp_platforms[idx]])
+    end
+    return collect(formats)
+end
+
+"""
+    Sandbox.register_multiarch(config::SandboxConfig)
+
+Registers with the kernel (`binfmt_misc`) the QEMU interpreters that running executables
+of `config.multiarch` in the sandbox needs, unless they already are.  Uses `sudo`.
+"""
+register_multiarch(config) = register_requested_formats!(multiarch_formats(config.multiarch); verbose=config.verbose)

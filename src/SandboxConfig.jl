@@ -1,177 +1,153 @@
-using Base.BinaryPlatforms, EnumX
-const AnyRedirectable = Union{Base.AbstractCmd, Base.TTY, <:IO}
-
-@enumx MountType begin
-    ReadWrite
-    ReadOnly
-    Overlayed
-    OverlayedReadOnly
-end
-struct MountInfo
-    host_path::String
-    type::MountType.T
-end
-export MountInfo, MountType
-
 """
-    SandboxConfig(read_only_maps, read_write_maps, env)
+    SandboxConfig(; rootfs, mounts=[], defaults=true, env=Dict(), cwd="/", uid=0, gid=0,
+                  hostname=nothing, persist=nothing, tmpfs_size=nothing, mode=:userns,
+                  multiarch=Platform[], verbose=false)
 
-Sandbox executors require a configuration to set up the environment properly.
+What a sandbox is made of.  [`Sandbox.command`](@ref) turns it and a command into a
+`Cmd` that runs the command in it.
 
-- `read_only_maps`: Directories that are mapped into the sandbox as read-only mappings.
-   - Specified as pairs, e.g. `sandbox_path => host_path`.  All paths must be absolute.
-   - Must always include a mapping for root, e.g. `"/" => rootfs_path`.
-
-- `read_write_maps`: Directories that are mapped into the sandbox as read-write mappings.
-   - Specified as pairs, e.g. `sandbox_path => host_path`.  All paths must be absolute.
-   - Note that some executors may not show perfect live updates; consistency is guaranteed
-     only after execution is finished.
-
-- `env`: Dictionary mapping of environment variables that should be set within the sandbox.
-
-- `entrypoint`: Executable that gets passed the actual command being run.
-  - This is a path within the sandbox, and must be absolute.
-  - Defaults to `nothing`, which causes the command to be executed directly.
-
-- `pwd`: Set the working directory of the command that will be run.
-  - This is a path within the sandbox, and must be absolute.
-
-- `persist`: Tell the executor object to persist changes made to the rootfs.
-  - This is a boolean value, it is up to interpretation by the executor.
-  - Persistence is a property of an individual executor and changes live only as long
-    as the executor object itself.
-  - You cannot transfer persistent changes from one executor to another.
-
-- `multiarch`: Request multiarch executable support
-  - This is an array of `Platform` objects
-  - Sandbox will ensure that interpreters (such as `qemu-*-static` binaries) are
-    available for each platform.
-  - Requesting multiarch support for a platform that we don't support results in
-    an `ArgumentError`.
-
-- `uid` and `gid`: Numeric user and group identifiers to spawn the sandboxed process as.
-  - By default, these are both `0`, signifying `root` inside the sandbox.
-
-- `stdin`, `stdout`, `stderr`: input/output streams for the sandboxed process.
-  - Can be any kind of `IO`, `TTY`, `devnull`, etc...
-
-- `hostname`: Set the hostname within the sandbox, defaults to the current hostname
-
-- `tmpfs_size`: Size of the tmpfs that holds changes to the rootfs when `persist` is
-  `false` (user namespace executors only), e.g. `"2G"`.
-
-- `shm_size`: Size of the sandbox's private `/dev/shm`, e.g. `"1G"`.
-  - Defaults to `nothing`, which leaves it at half of the memory.
-
-- `verbose`: Set whether the sandbox construction process should be more or less verbose.
+- `rootfs`: the host directory that is the sandbox's `/`.  The sandbox sees an overlay
+  of it: its changes go to `persist`, not to `rootfs`.
+- `mounts`: `destination => mount` pairs, mounted in order after the default mounts (see
+  [`Sandbox.default_mounts`](@ref)); each mount is a [`Bind`](@ref), [`Overlay`](@ref),
+  [`Tmpfs`](@ref) or [`Symlink`](@ref).  A later mount at the same place covers an
+  earlier one.  A dictionary is mounted parents first.  A mount at or above a default
+  mount's destination replaces that default.
+- `defaults`: whether to start from the default mounts.
+- `env`: the environment of the command, to which that of the command itself is added.
+- `cwd`: the command's working directory, created if it doesn't exist.
+- `uid`, `gid`: who the command runs as, root by default.  Whatever the ids in the
+  sandbox, files are created as the calling user on the host.
+- `hostname`: the sandbox's hostname.
+- `persist`: a directory that keeps the changes to the rootfs and to the overlays, for a
+  later sandbox with the same directory to see.  It belongs to the caller, who creates
+  it and removes it, and only one sandbox may use it at a time.  See
+  [`Sandbox.probe_persist`](@ref).  Without it, changes go to a tmpfs and are gone when
+  the command exits.
+- `tmpfs_size`: the size of that tmpfs, `"1G"` by default.
+- `mode`: `:userns` sets up the sandbox in a user namespace, without privileges.  `:sudo`
+  sets it up as root, through `sudo`, for kernels that don't allow an overlay in a user
+  namespace; the command still runs as the calling user.
+- `multiarch`: platforms whose executables the sandbox should be able to run, through
+  QEMU.  [`Sandbox.register_multiarch`](@ref) registers what that needs with the kernel
+  (`run` does so itself).
+- `verbose`: have the launcher tell what it sets up.
 """
 struct SandboxConfig
-    mounts::Dict{String,MountInfo}
+    rootfs::String
+    mounts::Vector{Pair{String,Mount}}
+    defaults::Bool
     env::Dict{String,String}
-    entrypoint::Union{String,Nothing}
-    pwd::String
-    persist::Bool
-    multiarch_formats::Vector{BinFmtRegistration}
-    uid::Cint
-    gid::Cint
-    tmpfs_size::Union{String, Nothing}
-    shm_size::Union{String, Nothing}
-    hostname::Union{String, Nothing}
-
-    stdin::AnyRedirectable
-    stdout::AnyRedirectable
-    stderr::AnyRedirectable
+    cwd::String
+    uid::UInt32
+    gid::UInt32
+    hostname::Union{Nothing,String}
+    persist::Union{Nothing,String}
+    tmpfs_size::Union{Nothing,String}
+    mode::Symbol
+    multiarch::Vector{Platform}
     verbose::Bool
 
-    function SandboxConfig(mounts::Dict{String,MountInfo},
-                           env::Dict{String,String} = Dict{String,String}();
-                           entrypoint::Union{String,Nothing} = nothing,
-                           pwd::String = "/",
-                           persist::Bool = true,
-                           multiarch::Vector{<:Platform} = Platform[],
-                           uid::Integer=0,
-                           gid::Integer=0,
-                           tmpfs_size::Union{String, Nothing}=nothing,
-                           shm_size::Union{String, Nothing}=nothing,
-                           hostname::Union{String, Nothing}=nothing,
-                           stdin::AnyRedirectable = Base.devnull,
-                           stdout::AnyRedirectable = Base.stdout,
-                           stderr::AnyRedirectable = Base.stderr,
+    function SandboxConfig(; rootfs::AbstractString,
+                           mounts::Union{AbstractVector,AbstractDict} = Pair{String,Mount}[],
+                           defaults::Bool = true,
+                           env = Dict{String,String}(),
+                           cwd::AbstractString = "/",
+                           uid::Integer = 0,
+                           gid::Integer = 0,
+                           hostname::Union{Nothing,AbstractString} = nothing,
+                           persist::Union{Nothing,AbstractString} = nothing,
+                           tmpfs_size::Union{Nothing,Integer,AbstractString} = nothing,
+                           mode::Symbol = :userns,
+                           multiarch::AbstractVector{<:Platform} = Platform[],
                            verbose::Bool = false)
-        # Lint the maps to ensure that all are absolute paths:
-        for path in [keys(mounts)..., [v.host_path for v in values(mounts)]...,
-                     something(entrypoint, "/"), pwd]
-            if !startswith(path, "/")
-                throw(ArgumentError("Path mapping $(path) is not absolute!"))
+        isabspath(rootfs) || throw(ArgumentError("rootfs \"$(rootfs)\" is not absolute"))
+        mounts = normalize_mounts(mounts)
+        overlays = [dest for (dest, m) in mounts if m isa Overlay]
+        allunique(overlays) ||
+            throw(ArgumentError("more than one overlay at the same destination, which would share their changes"))
+        for (dest, m) in mounts
+            if m isa Union{Bind,Overlay} && !isabspath(m.source)
+                throw(ArgumentError("mount source \"$(m.source)\" of \"$(dest)\" is not absolute"))
             end
         end
-
-        for (sandbox_path, mount_info) in mounts
-            # Force every path to be `realpath()`'ed (up to the point of existence)
-            # This allows us to point to as-of-yet nonexistant files, but to collapse
-            # as many symlinks as possible.
-            mount_info = MountInfo(realpath_stem(mount_info.host_path), mount_info.type)
-            mounts[sandbox_path] = mount_info
-
-            # Disallow ecryptfs mount points, they don't play well with user namespaces.
-            crypt, mountpoint = is_ecryptfs(mount_info.host_path; verbose)
-            if crypt
-                throw(ArgumentError("Path $(mount_info.host_path) is mounted on the ecryptfs filesystem $(mountpoint)!"))
-            end
-        end
-
-        # Ensure that read_only_maps contains a mapping for the root in the guest:
-        if !haskey(mounts, "/") || mounts["/"].type != MountType.Overlayed
-            throw(ArgumentError("Must provide an overlayed root mapping!"))
-        end
-
-        # Collect all multiarch platforms, mapping to the known interpreter for that platform.
-        multiarch_formats = Set{BinFmtRegistration}()
-        interp_platforms = collect(keys(platform_qemu_registrations))
-        for platform in multiarch
-            # If this platform is natively runnable, skip it
-            if natively_runnable(platform)
-                continue
-            end
-
-            platform_idx = findfirst(p -> platforms_match(platform, p), interp_platforms)
-            if platform_idx === nothing
-                throw(ArgumentError("Platform $(triplet(platform)) unsupported for multiarch!"))
-            end
-            push!(multiarch_formats, platform_qemu_registrations[interp_platforms[platform_idx]])
-        end
-
-        return new(mounts, env, entrypoint, pwd, persist, collect(multiarch_formats), Cint(uid), Cint(gid), tmpfs_size, shm_size, hostname, stdin, stdout, stderr, verbose)
-    end
-
-    # Inner constructor that takes an existing SandboxConfig and allows modifying stdio
-    function SandboxConfig(config::SandboxConfig;
-                           stdin::AnyRedirectable = config.stdin,
-                           stdout::AnyRedirectable = config.stdout,
-                           stderr::AnyRedirectable = config.stderr)
-        return new(config.mounts, config.env, config.entrypoint, config.pwd,
-                   config.persist, config.multiarch_formats, config.uid, config.gid,
-                   config.tmpfs_size, config.shm_size, config.hostname, stdin, stdout, stderr, config.verbose)
+        isabspath(cwd) || throw(ArgumentError("cwd \"$(cwd)\" is not absolute"))
+        mode in (:userns, :sudo) || throw(ArgumentError("mode must be :userns or :sudo, not $(repr(mode))"))
+        tmpfs_size === nothing || (tmpfs_size = Tmpfs(size=tmpfs_size).size)
+        multiarch_formats(multiarch)  # throws for unsupported platforms
+        return new(rootfs, mounts, defaults, Dict{String,String}(env), cwd, uid, gid,
+                   hostname, persist === nothing ? nothing : abspath(persist), tmpfs_size,
+                   mode, multiarch, verbose)
     end
 end
 
+# The mounts, defaults included, in the order the launcher mounts them.
+function all_mounts(config::SandboxConfig)
+    config.defaults || return config.mounts
+    defaults = filter(default_mounts()) do (dest, _)
+        !any(m -> within(dest, m.first), config.mounts)
+    end
+    return [defaults; config.mounts]
+end
 
-# Compatibility shim for `read_only_maps`/`read_write_maps` API:
-function SandboxConfig(read_only_maps::Dict{String,String},
-                       read_write_maps::Dict{String,String} = Dict{String,String}(),
-                       env::Dict{String,String} = Dict{String,String}();
-                       kwargs...)
-    # Our new API uses a unified `mounts` with mount types set:
-    mounts = Dict{String,MountInfo}()
-    for (sandbox_path, host_path) in read_only_maps
-        mt = sandbox_path == "/" ? MountType.Overlayed : MountType.ReadOnly
-        mounts[sandbox_path] = MountInfo(host_path, mt)
+"""
+    Sandbox.command(config::SandboxConfig, cmd::Cmd) -> Cmd
+
+The command that runs `cmd` in the sandbox `config`.  Run it as any other, with `run`,
+`pipeline`, `open` or `read`: its standard streams are those of `cmd` in the sandbox.  It
+exits as `cmd` does, or with 125 if the sandbox could not be set up, 126 if `cmd` could not
+be executed, and 127 if it was not found.
+
+`cmd`'s executable is a path in the sandbox, not looked up in its `PATH`.  Its environment
+is `config.env` plus that of `cmd`, and nothing else; `ignorestatus`, `detach` and `cpus`
+carry over.  `cmd` can't have a `dir`: the working directory is `config.cwd`.
+
+This has no side effects.  Unlike `run(config, cmd)`, it doesn't register the interpreters
+for `config.multiarch` (see [`Sandbox.register_multiarch`](@ref)).
+"""
+function command(config::SandboxConfig, cmd::Cmd)
+    isempty(cmd.dir) ||
+        throw(ArgumentError("the working directory in the sandbox is the config's `cwd`, not the command's `dir`"))
+    args = String[UserNSSandbox_jll.sandbox_path, "--protocol", "3"]
+    config.verbose && push!(args, "--verbose")
+    config.mode == :sudo && push!(args, "--privileged")
+    append!(args, ["--rootfs", config.rootfs, "--cd", config.cwd,
+                   "--uid", string(config.uid), "--gid", string(config.gid)])
+    config.persist === nothing || append!(args, ["--persist", config.persist])
+    config.tmpfs_size === nothing || append!(args, ["--tmpfs-size", config.tmpfs_size])
+    config.hostname === nothing || append!(args, ["--hostname", config.hostname])
+    for (dest, m) in all_mounts(config)
+        append!(args, operation(dest, m))
     end
-    for (sandbox_path, host_path) in read_write_maps
-        if sandbox_path ∈ keys(mounts)
-            throw(ArgumentError("Cannot specify the same sandbox path twice in maps! ('$(sandbox_path)')"))
-        end
-        mounts[sandbox_path] = MountInfo(host_path, MountType.ReadWrite)
+    push!(args, "--")
+    append!(args, cmd.exec)
+
+    env = copy(config.env)
+    for var in something(cmd.env, String[])
+        name, value = split(var, '='; limit=2)
+        env[name] = value
     end
-    return SandboxConfig(mounts, env; kwargs...)
+    env = sort!(["$(name)=$(value)" for (name, value) in env])
+    if config.mode == :sudo
+        # sudo adds variables of its own (`HOME`, `USER`, `SUDO_*`, ...), and sudo-rs doesn't
+        # support `-E`, so set the environment with `env -i` instead.  The launcher reads
+        # the caller's ids from `SUDO_UID` and `SUDO_GID`, and unsets them.
+        args = ["sudo", "/usr/bin/env", "-i", "--", env...,
+                "SUDO_UID=$(getuid())", "SUDO_GID=$(getgid())", args...]
+        env = String[]
+    end
+    return Cmd(Cmd(args); env, ignorestatus=cmd.ignorestatus, cpus=cmd.cpus,
+               detach=cmd.flags & Base.UV_PROCESS_DETACHED != 0)
+end
+
+"""
+    run(config::SandboxConfig, cmd::Cmd; wait=true)
+
+Registers the interpreters for `config.multiarch`, if needed, then runs `cmd` in the
+sandbox.  Shorthand for `run(Sandbox.command(config, cmd); wait)` after
+[`Sandbox.register_multiarch(config)`](@ref Sandbox.register_multiarch).
+"""
+function Base.run(config::SandboxConfig, cmd::Cmd; wait::Bool=true)
+    register_multiarch(config)
+    return run(command(config, cmd); wait)
 end
