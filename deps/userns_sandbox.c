@@ -123,6 +123,13 @@ static void mount_the_world(const char * root_dir,
                             uid_t uid, gid_t gid,
                             const char * persist_dir,
                             const char * tmpfs_size) {
+  // systemd makes `/` a shared mount, so the mount namespace we were just given
+  // shares its mounts with the host's, as peers in privileged mode, and as slaves
+  // otherwise (being owned by a less privileged user namespace).  Make them private:
+  // our mounts must not propagate to the host, nor the host's later mounts into
+  // the sandbox.
+  check(0 == mount(NULL, "/", NULL, MS_PRIVATE|MS_REC, NULL));
+
   // If `persist_dir` is specified, it represents a host directory that should
   // be used to store our overlayfs work data.  This is where modifications to
   // the rootfs and such will go.  Typically, these should be ephemeral (and if
@@ -745,12 +752,6 @@ int main(int sandbox_argc, char **sandbox_argv) {
     // We dissociate ourselves from the typical mount namespace.  This gives us the freedom
     // to start mounting things willy-nilly without mucking up the user's computer.
     check(0 == unshare(CLONE_NEWNS));
-
-    // Even if we unshare, we might need to mark `/` as private, as systemd often subverts
-    // the kernel's default value of `MS_PRIVATE` on the root mount.  This doesn't effect
-    // the main root mount, because we have unshared, but this prevents our changes to
-    // any subtrees of `/` (e.g. everything) from propagating back to the outside `/`.
-    check(0 == mount(NULL, "/", NULL, MS_PRIVATE|MS_REC, NULL));
 
     // Mount the rootfs, shards, and workspace.  We do this here because, on this machine,
     // we may not have permissions to mount overlayfs within user namespaces.

@@ -126,6 +126,12 @@ for executor in userns_executors
             @test out == "found\n"
         end
 
+        @testset "no mount propagation from the host" begin
+            # None of the sandbox's mounts is a peer or slave of a host mount
+            ok, out, err = sandbox_sh(executor, "grep -cE ' (shared|master):' /proc/self/mountinfo")
+            @test out == "0\n"
+        end
+
         @testset "private IPC namespace and /dev/shm" begin
             # A marker in the host's /dev/shm must not be visible inside
             marker = "sandbox-isolation-test-$(getpid())"
