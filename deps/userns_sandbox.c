@@ -212,6 +212,12 @@ static void mount_the_world(const char * root_dir,
  * so they are made after `clone()` in both execution modes:
  *   - a fresh tmpfs on /dev/shm, private to the sandbox like its IPC namespace;
  *     its pages are charged to the memory cgroup of the processes that use them.
+ *   - a read-only cgroup2 mount on /sys/fs/cgroup, rooted at the cgroup the sandbox
+ *     was started in (the root of its cgroup namespace).  It covers the host's
+ *     writable hierarchy that came in with /sys, so the sandbox can read its own
+ *     limits (as /proc/self/cgroup says `0::/`) but cannot reach any other cgroup.
+ *     On hosts without a cgroup2 hierarchy at /sys/fs/cgroup there is no such view
+ *     to give, so the host's hierarchies are hidden behind an empty tmpfs instead.
  */
 static void mount_private(const char * root_dir, const char * shm_size) {
   char path[PATH_MAX];
@@ -229,6 +235,39 @@ static void mount_private(const char * root_dir, const char * shm_size) {
     fprintf(stderr, "--> Mounting tmpfs at %s (%s)\n", path, options);
   }
   check(0 == mount("tmpfs", path, "tmpfs", MS_NOSUID|MS_NODEV, options));
+
+  struct statfs cgroup_fs;
+  snprintf(path, sizeof(path), "%s/sys/fs/cgroup", root_dir);
+  if (statfs(path, &cgroup_fs) != 0) {
+    // No /sys/fs/cgroup on the host, so nothing to cover.
+    return;
+  }
+  unsigned long cgroup_flags = MS_NOSUID|MS_NODEV|MS_NOEXEC;
+  if (cgroup_fs.f_type == CGROUP2_SUPER_MAGIC) {
+    if (verbose) {
+      fprintf(stderr, "--> Mounting cgroup2 at %s (read-only)\n", path);
+    }
+    // The new mount shares its superblock with the host's mount it covers, which
+    // mount(2) refuses to stack directly (EBUSY), and the superblock is writable, so
+    // it cannot be asked for read-only either.  Mount it in the scratch space of the
+    // fresh /dev/shm, make that mount read-only, then move it into place.
+    char staging[PATH_MAX];
+    snprintf(staging, sizeof(staging), "%s/dev/shm/.cgroup", root_dir);
+    check(0 == mkdir(staging, 0700));
+    if (0 != mount("cgroup2", staging, "cgroup2", cgroup_flags, NULL)) {
+      fprintf(stderr, "ERROR: Failed to mount cgroup2: %s (errno %d)\n",
+              strerror(errno), errno);
+      _exit(1);
+    }
+    check(0 == mount(NULL, staging, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|cgroup_flags, NULL));
+    check(0 == mount(staging, path, NULL, MS_MOVE, NULL));
+    check(0 == rmdir(staging));
+  } else {
+    if (verbose) {
+      fprintf(stderr, "--> No cgroup2 hierarchy at %s, hiding it behind an empty tmpfs\n", path);
+    }
+    check(0 == mount("tmpfs", path, "tmpfs", MS_RDONLY|cgroup_flags, "size=4k,mode=0755"));
+  }
 }
 
 /*
@@ -613,8 +652,9 @@ int main(int sandbox_argc, char **sandbox_argv) {
   }
 
   // We want to request a new PID space, a new mount space, a new user space, and
-  // private hostname and IPC namespaces.
-  int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWIPC | SIGCHLD;
+  // private hostname, IPC and cgroup namespaces.
+  int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWIPC |
+                    CLONE_NEWCGROUP | SIGCHLD;
   if ((child_pid = syscall(SYS_clone, clone_flags, 0, 0, 0, 0)) == 0) {
     // If we're in here, we have become the "child" process, within the container.
 

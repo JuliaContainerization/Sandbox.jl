@@ -32,6 +32,12 @@ function sandbox_sh(executor, script; mounts=Dict{String,MountInfo}(), kwargs...
     return ok, String(take!(stdout)), String(take!(stderr))
 end
 
+host_cgroup2 = any(eachline("/proc/self/mounts")) do line
+    fields = split(line)
+    return fields[2] == "/sys/fs/cgroup" && fields[3] == "cgroup2"
+end
+host_cgroup_dir() = "/sys/fs/cgroup" * replace(readline("/proc/self/cgroup"), r"^0::" => "")
+
 for executor in userns_executors
     @testset "$(executor) isolation" begin
         @testset "file maps create parent directories" begin
@@ -73,6 +79,39 @@ for executor in userns_executors
             ok, out, err = sandbox_sh(executor, script; shm_size="8M")
             @test !ok
             @test occursin("No space left on device", err)
+        end
+
+        @testset "cgroup namespace and read-only cgroup2 view" begin
+            ok, out, err = sandbox_sh(executor, """
+                readlink /proc/self/ns/cgroup
+                grep '^0::' /proc/self/cgroup || echo none
+                stat -f -c %T /sys/fs/cgroup
+                grep ' /sys/fs/cgroup ' /proc/self/mounts | tail -n 1 | cut -d' ' -f3,4
+                ls -A /sys/fs/cgroup | tr '\\n' ' '
+                """)
+            @test ok
+            lines = split(out, '\n')
+            @test lines[1] != readlink("/proc/self/ns/cgroup")
+            if host_cgroup2
+                @test lines[2] == "0::/"
+                @test lines[3] == "cgroup2fs"
+                fstype, options = split(lines[4])
+                @test fstype == "cgroup2"
+                @test "ro" in split(options, ',')
+                # The view is rooted at the cgroup the sandbox was started in, which for
+                # the unprivileged executor is ours.
+                if executor == UnprivilegedUserNamespacesExecutor
+                    @test Set(split(lines[5])) == Set(readdir(host_cgroup_dir()))
+                end
+
+                # Neither limits nor membership can be changed through it
+                @test !sandbox_sh(executor, "echo max > /sys/fs/cgroup/memory.max")[1]
+                @test !sandbox_sh(executor, "echo \$\$ > /sys/fs/cgroup/cgroup.procs")[1]
+                @test !sandbox_sh(executor, "mkdir /sys/fs/cgroup/child")[1]
+            else
+                @test lines[3] == "tmpfs"
+                @test isempty(strip(lines[5]))
+            end
         end
     end
 end
