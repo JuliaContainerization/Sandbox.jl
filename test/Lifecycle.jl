@@ -129,8 +129,10 @@ for executor in userns_executors
                 try
                     @test wait_until(() -> !isempty(find_pids(pid -> cmdline(pid) == ["/bin/sleep", token])))
                     # Not `p`, which is sudo in privileged mode: it can't pass on a SIGKILL.
-                    launcher = only(find_pids(pid -> comm(pid) == "userns_sandbox" &&
-                                                     comm(ppid(pid)) != "userns_sandbox" &&
+                    # The JLL installs the launcher as `sandbox`, a local build as `userns_sandbox`
+                    name = first(basename(UserNSSandbox_jll.sandbox_path), 15)
+                    launcher = only(find_pids(pid -> comm(pid) == name &&
+                                                     comm(ppid(pid)) != name &&
                                                      token in cmdline(pid)))
                     run(`$(sudo) kill -KILL $(launcher)`)
                     wait(p)
