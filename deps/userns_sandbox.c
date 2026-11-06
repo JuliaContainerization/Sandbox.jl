@@ -17,8 +17,8 @@
 
   Unprivileged mode (the default) sets all of this up in a new user namespace.  When
   the kernel doesn't allow mounting an overlayfs in a user namespace, the mounts can be
-  made as real root instead (privileged mode), before the sandbox drops to the calling
-  user.
+  made as real root instead (`--privileged`, through sudo), before the sandbox drops to
+  the calling user, whose ids sudo passes in SUDO_UID and SUDO_GID.
 
   To try it out:
 
@@ -68,7 +68,7 @@ enum {
   UNPRIVILEGED_CONTAINER_MODE,
   PRIVILEGED_CONTAINER_MODE,
 };
-static int execution_mode;
+static int execution_mode = UNPRIVILEGED_CONTAINER_MODE;
 
 // Whether the overlays have the `userxattr` option; see `mount_persisted_root()`.
 static int userxattr = 0;
@@ -91,6 +91,7 @@ static void print_help() {
     "                            which only one sandbox at a time may use\n"
     "  --tmpfs-size SIZE         size of the tmpfs that holds the changes without --persist\n"
     "  --uid UID, --gid GID      the sandbox's user and group (default 0)\n"
+    "  --privileged              mount as root, then run as the user sudo was called by\n"
     "  --hostname NAME           the sandbox's hostname\n"
     "  --cd DIR                  the command's working directory, created if missing\n"
     "  --verbose                 tell what is being set up\n"
@@ -230,6 +231,8 @@ static int parse_args(int argc, char **argv, const char **uid_arg, const char **
       break;
     } else if (strcmp(opt, "--verbose") == 0) {
       verbose = 1;
+    } else if (strcmp(opt, "--privileged") == 0) {
+      execution_mode = PRIVILEGED_CONTAINER_MODE;
     } else if (strcmp(opt, "--rootfs") == 0) {
       set_once(&sandbox_root, &i, argc, argv);
     } else if (strcmp(opt, "--persist") == 0) {
@@ -860,49 +863,24 @@ int main(int sandbox_argc, char **sandbox_argv) {
   uid_t dst_uid = uid_arg ? parse_id(uid_arg, "uid") : 0;
   gid_t dst_gid = gid_arg ? parse_id(gid_arg, "gid") : 0;
 
-  // First, determine our execution mode based on pid and euid (allowing for override)
-  const char * forced_mode = getenv("FORCE_SANDBOX_MODE");
-  if (forced_mode != NULL) {
-    if (strcmp(forced_mode, "privileged") == 0) {
-      execution_mode = PRIVILEGED_CONTAINER_MODE;
-    } else if (strcmp(forced_mode, "unprivileged") == 0) {
-      execution_mode = UNPRIVILEGED_CONTAINER_MODE;
-    } else {
-      fprintf(stderr, "ERROR: Unknown FORCE_SANDBOX_MODE argument \"%s\"\n", forced_mode);
-      _exit(EXIT_SANDBOX_FAILED);
-    }
-  } else {
-    if(geteuid() == 0) {
-      execution_mode = PRIVILEGED_CONTAINER_MODE;
-    } else {
-      execution_mode = UNPRIVILEGED_CONTAINER_MODE;
-    }
-
-    // Once we're inside the sandbox, we can always use "unprivileged" mode
-    // since we've got mad permissions inside; so just always do that.
-    setenv("FORCE_SANDBOX_MODE", "unprivileged", 0);
-  }
   if (verbose) {
     fprintf(stderr, "verbose sandbox enabled (running in %sprivileged container mode)\n",
             execution_mode == UNPRIVILEGED_CONTAINER_MODE ? "un" : "");
   }
 
+  // In privileged mode, the sandbox runs as the user who called sudo.  Nested sandboxes
+  // must not see these.
   uid_t uid = getuid();
   gid_t gid = getgid();
-
-  // If we're running inside of `sudo`, we need to grab the UID/GID of the calling user through
-  // environment variables, not using `getuid()` or `getgid()`.  :(
-  const char * SUDO_UID = getenv("SUDO_UID");
-  if (SUDO_UID != NULL && SUDO_UID[0] != '\0') {
-    uid = strtol(SUDO_UID, NULL, 10);
+  const char *sudo_uid = getenv("SUDO_UID"), *sudo_gid = getenv("SUDO_GID");
+  if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
+    if (sudo_uid != NULL) {
+      uid = parse_id(sudo_uid, "SUDO_UID");
+    }
+    if (sudo_gid != NULL) {
+      gid = parse_id(sudo_gid, "SUDO_GID");
+    }
   }
-  const char * SUDO_GID = getenv("SUDO_GID");
-  if (SUDO_GID != NULL && SUDO_GID[0] != '\0') {
-    gid = strtol(SUDO_GID, NULL, 10);
-  }
-
-  // Hide these from children so that we don't carry the outside UID numbers into
-  // nested sandboxen; that would cause problems when we refer to UIDs that don't exist.
   unsetenv("SUDO_UID");
   unsetenv("SUDO_GID");
 

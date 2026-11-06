@@ -39,16 +39,12 @@ end
 # For debugging, dump the list of mounts:
 #run(`mount`)
 
-# This should always default to the unprivileged executor, since if we're nested, `FORCE_SANDBOX_MODE` should be set
 with_executor() do exe
     @test success(exe, config, `/bin/sh -c "echo science > /tmp/readwrite/double_nested.txt"`)
 end
 @test String(read("/tmp/readwrite/double_nested.txt")) == "science\n"
 
-# The sandbox binary picks its mode from its own euid, as `FORCE_SANDBOX_MODE` is not in
-# the nested sandbox's environment: started as root, it runs privileged, mounting the
-# rootfs before creating its user namespace and a procfs for its PID namespace after.
+# The launcher's mode is what it is told, also when started as root in the sandbox.
 inner_log = String(take!(inner_stderr))
 print(stderr, inner_log)
-mode = Sandbox.getuid() == 0 ? "privileged" : "unprivileged"
-@test occursin("running in $(mode) container mode", inner_log)
+@test occursin("running in unprivileged container mode", inner_log)
