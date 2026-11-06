@@ -396,10 +396,14 @@ int main(int sandbox_argc, char **sandbox_argv) {
       break;
 
     switch( c ) {
-      case '?':
       case 'h':
         print_help();
         return 0;
+      case '?':
+        // getopt already printed what was wrong; an option we don't know must not
+        // look like a successful run to a caller that expected it to take effect.
+        print_help();
+        return 1;
       case 'v':
         verbose = 1;
         fprintf(stderr, "verbose sandbox enabled (running in ");

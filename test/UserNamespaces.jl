@@ -134,6 +134,19 @@ end
     end
 end
 
+# Behaviour of the sandbox binary that the released UserNSSandbox_jll does not have yet.
+# Only test it against a binary built from this checkout.
+if should_build_local_sandbox && UserNSSandbox_jll.is_available()
+    @testset "sandbox binary options" begin
+        for exe in (UserNSSandbox_jll.sandbox_path, UserNSSandbox_jll.overlay_probe_path)
+            @test success(pipeline(`$(exe) --help`; stderr=devnull))
+            stderr = IOBuffer()
+            @test !success(pipeline(`$(exe) --no-such-option`; stderr))
+            @test occursin("no-such-option", String(take!(stderr)))
+        end
+    end
+end
+
 if executor_available(UnprivilegedUserNamespacesExecutor)
     rootfs_dir = Sandbox.debian_rootfs()
     @testset "UnprivilegedUserNamespacesExecutor" begin
