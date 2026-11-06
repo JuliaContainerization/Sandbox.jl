@@ -29,10 +29,11 @@ pid_t raw_fork(void) {
   return syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
 }
 
-/* Opens /proc/%pid/%file */
+/* Opens /proc/%pid/%file, or /proc/self/%file for a `pid` of 0 */
 int open_proc_file(pid_t pid, const char *file, int mode) {
   char path[PATH_MAX];
-  int n = snprintf(path, sizeof(path), "/proc/%d/%s", pid, file);
+  int n = pid == 0 ? snprintf(path, sizeof(path), "/proc/self/%s", file)
+                   : snprintf(path, sizeof(path), "/proc/%d/%s", pid, file);
   check(n >= 0 && n < sizeof(path));
   int fd = open(path, mode | O_CLOEXEC);
   check(fd != -1);
@@ -639,32 +640,38 @@ void make_readonly(int fd, const char *dest) {
   make_readonly_fallback(fd, dest);
 }
 
-void mount_procfs(const char * root_dir, uid_t uid, gid_t gid) {
-  char path[FD_PATH_SIZE];
-
-  int root_fd = open_root(root_dir);
-  int fd = open_in_root_or_die(root_fd, "/proc", 0);
-  fd_path(path, fd);
-  if (verbose) {
-    fprintf(stderr, "--> Mounting procfs at %s/proc\n", root_dir);
+/*
+ * Refuses a destination such as `/a/..`, or a symlink to `/`, which would cover the root
+ * itself: the rest of the setup (going through `root_fd`) would no longer see it.
+ */
+void check_not_root(int root_fd, int fd, const char *dest) {
+  struct stat dest_stat, root_stat;
+  check(0 == fstat(fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
+  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
+    fprintf(stderr, "ERROR: Failed to mount at '%s': it is the root of the sandbox\n", dest);
+    _exit(EXIT_SANDBOX_FAILED);
   }
-  check(0 == mount("proc", path, "proc", 0, ""));
-  close(fd);
-
-  // Chown this directory to the desired UID/GID, so that it doesn't look like it's
-  // owned by "nobody" when we're inside the sandbox.  We allow this to fail, as
-  // sometimes we're trying to chown() something we don't own.
-  fd = open_in_root_or_die(root_fd, "/proc", 0);
-  int ignored = fchownat(fd, "", uid, gid, AT_EMPTY_PATH);
-  close(fd);
-  close(root_fd);
 }
 
 /*
- * Bind-mounts the host path `src` (or a /proc/self/fd path) at `dest` in the rootfs
- * `root_fd`, creating the mount point as a directory or file to match `src`.
+ * Refuses `fd` in the procfs, which the sandbox's init mounts again over the operations,
+ * as `add_op()` does for destinations that say /proc, for those that only get there
+ * through `..` or symlinks.
  */
-void bind_mount(int root_fd, const char *src, const char *dest, char read_only) {
+void check_not_proc(int fd, const char *dest) {
+  struct statfs fs;
+  check(0 == fstatfs(fd, &fs));
+  if (fs.f_type == PROC_SUPER_MAGIC) {
+    fprintf(stderr, "ERROR: Failed to mount at '%s': it is in /proc, which the sandbox mounts itself\n", dest);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+}
+
+/*
+ * Bind-mounts `src_fd` (the host path `src`) at `dest` in the rootfs `root_fd`, creating
+ * the mount point as a directory or file to match it.
+ */
+void bind_mount(int root_fd, int src_fd, const char *src, const char *dest, char read_only) {
   char src_path[FD_PATH_SIZE], dest_path[FD_PATH_SIZE];
 
   if (verbose) {
@@ -672,46 +679,23 @@ void bind_mount(int root_fd, const char *src, const char *dest, char read_only) 
             read_only ? "read-only" : "read-write");
   }
 
-  int src_fd = open(src, O_PATH | O_CLOEXEC);
-  if (src_fd == -1) {
-    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': %s (errno %d)\n",
-            src, dest, strerror(errno), errno);
-    fprintf(stderr, "  Please ensure that '%s' exists and is accessible.\n", src);
-    _exit(EXIT_SANDBOX_FAILED);
-  }
   struct stat src_stat;
   check(0 == fstat(src_fd, &src_stat));
   fd_path(src_path, src_fd);
 
   int dest_fd = open_in_root_or_die(root_fd, dest, S_ISDIR(src_stat.st_mode) ? S_IFDIR : S_IFREG);
+  check_not_root(root_fd, dest_fd, dest);
+  check_not_proc(dest_fd, dest);
   fd_path(dest_path, dest_fd);
 
-  // A destination such as `/a/..`, or a symlink to `/`, would cover the root itself,
-  // which the rest of the setup (going through `root_fd`) would no longer see.
-  struct stat dest_stat, root_stat;
-  check(0 == fstat(dest_fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
-  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
-    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': it is the root of the sandbox\n", src, dest);
-    _exit(EXIT_SANDBOX_FAILED);
-  }
-
-  // We don't expect workspaces to have any submounts in normal operation.
-  // However, for runshell(), workspace could be an arbitrary directory,
-  // including one with sub-mounts, so allow that situation with MS_REC.
+  // Recursively, so that a bind of a tree with mounts below it shows them as well.
   check(0 == mount(src_path, dest_path, "", MS_BIND|MS_REC, NULL));
   close(dest_fd);
-  close(src_fd);
 
   if (read_only) {
     // The new mount is on top of the mount point, so look it up again.
     dest_fd = open_in_root_or_die(root_fd, dest, 0);
     make_readonly(dest_fd, dest);
     close(dest_fd);
-  }
-}
-
-void bind_host_node(int root_fd, const char *name, char read_only) {
-  if (access(name, F_OK) == 0) {
-    bind_mount(root_fd, name, name, read_only);
   }
 }
