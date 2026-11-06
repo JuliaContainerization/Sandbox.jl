@@ -1,19 +1,3 @@
-"""
-    max_directory_ctime(prefix::String)
-
-Takes the `stat()` of all files in a directory root, keeping the maximum ctime,
-recursively.  Comparing just this value allows for quick directory change detection.
-"""
-function max_directory_ctime(prefix::String)
-    max_time = 0.0
-    for (root, dirs, files) in walkdir(prefix)
-        for f in files
-            max_time = max(max_time, lstat(joinpath(root, f)).ctime)
-        end
-    end
-    return max_time
-end
-
 function get_mounts(;verbose::Bool = false)
     mounts_file = "/proc/self/mounts"
     # Get a listing of the current mounts.  If we can't do this, just give up

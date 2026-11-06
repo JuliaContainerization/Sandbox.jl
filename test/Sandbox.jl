@@ -153,8 +153,7 @@ for executor in all_executors
                     );
                 )
                 with_executor(executor) do exe
-                    # We don't support OverlayedReadOnly mounts on Docker right now
-                    @test success(exe, config, `/bin/sh -c "[ -d /read_only ]"`) broken=(executor == DockerExecutor)
+                    @test success(exe, config, `/bin/sh -c "[ -d /read_only ]"`)
                     @test !success(exe, config, `/bin/sh -c "echo aperture > /read_only/error.txt 2>&1"`)
                 end
             end
@@ -216,11 +215,9 @@ for executor in all_executors
                     stdout,
                     stderr,
                     persist=false,
-                    #verbose=executor == DockerExecutor,
                 )
-                # Modifying the rootfs works, and is temporary; for docker containers this is modifying
-                # the rootfs image, for userns this is all mounted within an overlay backed by a tmpfs,
-                # because we have `persist` set to `false`.  Modifying `/read_only` does not work,
+                # Modifying the rootfs works, and is temporary: it is all mounted within an
+                # overlay backed by a tmpfs, because we have `persist` set to `false`.  Modifying `/read_only` does not work,
                 # Modifying `/read_write` works and is visible to the host, modifying `/overlayed` works
                 # but is not visible to the host.
                 with_executor(executor) do exe
@@ -308,8 +305,7 @@ for executor in all_executors
 
         # A read-only overlay of another directory at the same place shows what an earlier
         # overlay there persisted (BinaryBuilder2 reads the results of a build this way).
-        # Docker doesn't support read-only overlays.
-        executor == DockerExecutor || @testset "read-only view of persisted changes" begin
+        @testset "read-only view of persisted changes" begin
             mktempdir() do dir
                 mkdir(joinpath(dir, "lower"))
                 mkdir(joinpath(dir, "empty"))
@@ -378,31 +374,6 @@ for executor in all_executors
                     str = String(take!(stdout))
                     @test contains(str, "uid=$(uid)")
                     @test contains(str, "gid=$(gid)")
-                end
-            end
-        end
-
-        # If we have the docker executor available (necessary to do the initial pull),
-        # let's test launching off of a docker image.  Only run this on x86_64 because
-        # docker doesn't (yet) have images with this name for other architectures.
-        if executor_available(DockerExecutor) && arch(HostPlatform()) == "x86_64"
-            julia_rootfs = Sandbox.pull_docker_image("julia:alpine")
-            @testset "launch from docker image" begin
-                stdout = IOBuffer()
-                stderr = IOBuffer()
-                config = SandboxConfig(
-                    Dict("/" => julia_rootfs),
-                    Dict{String,String}(),
-                    # Add the path to `julia` onto the path, then use `sh` to process the PATH
-                    Dict("PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin");
-                    stdout = stdout,
-                    stderr = stderr,
-                )
-
-                with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "julia -e 'println(\"Hello, Julia!\")'"`)
-                    @test String(take!(stdout)) == "Hello, Julia!\n";
-                    @test print_if_nonempty(take!(stderr))
                 end
             end
         end

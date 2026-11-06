@@ -130,33 +130,6 @@ end
                     @test isfile(joinpath(rw_dir, "double_nested.txt"))
                     @test String(read(joinpath(rw_dir, "single_nested.txt"))) == "aperture\n"
                     @test String(read(joinpath(rw_dir, "double_nested.txt"))) == "science\n"
-
-                    if executor <: DockerExecutor
-                        stderr = IOBuffer()
-                        config_with_stderr = SandboxConfig(
-                            ro_mappings,
-                            # Mount a temporary directory in as writable
-                            Dict("/tmp/readwrite" => rw_dir),
-                            # Add the path to `julia` onto the path
-                            Dict(
-                                "PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin",
-                                "HOME" => "/tmp/readwrite/home",
-                            );
-                            pwd = pkgdir,
-                            uid = Sandbox.getuid(),
-                            gid = Sandbox.getgid(),
-                            stderr = stderr,
-                            persist = false,
-                        )
-
-                        for privileges in [:no_new_privileges, :unprivileged]
-                            with_executor(executor; privileges) do exe
-                                @test !success(exe, config_with_stderr, cmd)
-                                # Ensure that we get the nested sandbox unable to run any nested sandboxing
-                                @test occursin("Could not find any available executors", String(take!(stderr)))
-                            end
-                        end
-                    end
                 end
             end
         end
