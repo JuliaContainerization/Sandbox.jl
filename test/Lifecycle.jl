@@ -1,8 +1,7 @@
 using Test, Sandbox
 
-# How the sandbox binary starts, reports on and stops the sandboxed command.  Like the
-# isolation tests, these cover behaviour the released UserNSSandbox_jll does not have yet,
-# and run against the executors that Isolation.jl found (`userns_executors`).
+# How the sandbox binary starts, reports on and stops the sandboxed command, against the
+# executors that Isolation.jl found (`userns_executors`).
 
 function sandbox_config(; mounts=Dict{String,MountInfo}(), kwargs...)
     return SandboxConfig(
