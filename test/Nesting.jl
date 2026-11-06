@@ -162,3 +162,44 @@ end
         end
     end
 end
+
+# The launcher of Sandbox.jl 2.0.2 (UserNSSandbox_jll 2024.6.23), which the Buildkite sandbox
+# plugin pins, in a sandbox as the sandboxed Buildkite agent sets it up: as root, with
+# FORCE_SANDBOX_MODE and a writable /persist.  Its rootfs is on the sandbox's root, as the
+# plugin downloads it there.
+if Sys.islinux() && arch(HostPlatform()) == "x86_64" && executor_available(UnprivilegedUserNamespacesExecutor)
+    @testset "Nesting the launcher of Sandbox.jl 2" begin
+        old = @get_scratch!("UserNSSandbox-2024.6.23")
+        if !isfile(joinpath(old, "bin", "sandbox"))
+            Pkg.PlatformEngines.download_verify_unpack(
+                "https://github.com/JuliaBinaryWrappers/UserNSSandbox_jll.jl/releases/download/UserNSSandbox-v2024.6.23+0/UserNSSandbox.v2024.6.23.x86_64-linux-gnu.tar.gz",
+                "982ed4e57d5a205bea64e9518d138096127c604161ee022d2c7c389fe67ce236", old; ignore_existence=true)
+        end
+        mktempdir() do dir
+            persist, ws = mkpath(joinpath(dir, "persist")), mkpath(joinpath(dir, "ws"))
+            config = SandboxConfig(
+                Dict("/" => Sandbox.debian_rootfs(), "/old" => old),
+                Dict("/persist" => persist, "/ws" => ws),
+                Dict("PATH" => "/usr/bin:/bin", "FORCE_SANDBOX_MODE" => "unprivileged",
+                     "SANDBOX_PERSISTENCE_DIR" => "/persist");
+                persist=false, stdout=IOBuffer(),
+            )
+            # A rootfs of `dash`, whose changes persist from one run to the next
+            script = raw"""
+                set -e
+                mkdir -p /r/proc /r/dev/pts /r/sys /r/ws
+                touch /r/dev/null /r/dev/tty /r/dev/zero /r/dev/random /r/dev/urandom /r/dev/ptmx
+                cp --parents /bin/dash $(ldd /bin/dash | grep -o '/[^ ]*') /r/
+                for i in 1 2; do
+                    /old/bin/sandbox --rootfs /r --cd /ws --mount /ws:/ws:rw --persist /persist/p \
+                        --userxattr --uid 0 --gid 0 -- /bin/dash -c '{ read l < /x; } 2>/dev/null && echo $l; echo $0 > /x' run$i
+                done > /ws/out
+                """
+            with_executor(UnprivilegedUserNamespacesExecutor) do exe
+                @test success(exe, config, `/bin/sh -c $(script)`)
+            end
+            @test read(joinpath(ws, "out"), String) == "run1\n"
+            run(`chmod -R u+rwX $(dir)`)
+        end
+    end
+end
