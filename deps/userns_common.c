@@ -18,6 +18,17 @@ void _check(int ok, const char * file, int line) {
   }
 }
 
+/*
+ * fork(2) without the C library's wrapper.  Our first child comes from a raw clone(2),
+ * which the C library doesn't know about.  With glibc 2.17 (BinaryBuilder's static
+ * builds), a fork() in that child and another in the grandchild deadlocks on malloc's
+ * arena lock.  The children of a raw fork mustn't use what the C library caches about
+ * the process either, such as its pid (getpid() before glibc 2.25).
+ */
+pid_t raw_fork(void) {
+  return syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+}
+
 /* Opens /proc/%pid/%file */
 int open_proc_file(pid_t pid, const char *file, int mode) {
   char path[PATH_MAX];

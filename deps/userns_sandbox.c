@@ -353,7 +353,7 @@ static void lock_sandbox() {
   // In privileged mode, `setuid()` reset our dumpability, which leaves our /proc
   // entries owned by an unmapped root and keeps us from writing our own maps.
   prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
-  configure_user_namespace(getpid(), uid, gid, uid, gid);
+  configure_user_namespace(syscall(SYS_getpid), uid, gid, uid, gid);
 
   // The sandboxed processes run as our user in this user namespace, so while we are
   // dumpable they could open our fds (the status pipe) through /proc/1/fd of their
@@ -439,7 +439,7 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
 
   // Our next child is the init of the sandboxed processes' PID namespace; it reports
   // their exit status to the parent itself.  We only pass signals on to it.
-  pid_t init_pid = fork();
+  pid_t init_pid = raw_fork();
   if (init_pid != 0) {
     check(init_pid != -1);
     close(parent_pipe[1]);
@@ -461,7 +461,7 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   }
 
   // When the main pid dies, we exit.
-  if ((child_pid = fork()) == 0) {
+  if ((child_pid = raw_fork()) == 0) {
     if (verbose) {
       fprintf(stderr, "About to run `%s` ", sandbox_argv[0]);
       int argc_i;

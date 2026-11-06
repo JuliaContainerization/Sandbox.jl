@@ -43,8 +43,19 @@
 #include <poll.h>
 #include <ftw.h>
 
+/* BinaryBuilder's sysroots have C library and kernel headers older than the kernels we
+   run on, so define what they lack. */
 #ifndef CGROUP2_SUPER_MAGIC
 #define CGROUP2_SUPER_MAGIC 0x63677270
+#endif
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+#ifndef CLONE_NEWCGROUP
+#define CLONE_NEWCGROUP 0x02000000
 #endif
 
 /**** Global Variables ***/
@@ -63,6 +74,7 @@ extern pid_t child_pid;
 
 
 /* General utilities */
+pid_t raw_fork(void);
 void _check(int ok, const char * file, int line);
 #define check(ok) _check(ok, __FILE__, __LINE__)
 int open_proc_file(pid_t pid, const char *file, int mode);
