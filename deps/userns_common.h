@@ -26,6 +26,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <signal.h>
@@ -41,6 +42,10 @@
 #include <byteswap.h>
 #include <mntent.h>
 #include <ftw.h>
+
+#ifndef CGROUP2_SUPER_MAGIC
+#define CGROUP2_SUPER_MAGIC 0x63677270
+#endif
 
 /**** Global Variables ***/
 #define TRUE 1

@@ -134,6 +134,19 @@ end
     end
 end
 
+# Behaviour of the sandbox binary that the released UserNSSandbox_jll does not have yet.
+# Only test it against a binary built from this checkout.
+if should_build_local_sandbox && UserNSSandbox_jll.is_available()
+    @testset "sandbox binary options" begin
+        for exe in (UserNSSandbox_jll.sandbox_path, UserNSSandbox_jll.overlay_probe_path)
+            @test success(pipeline(`$(exe) --help`; stderr=devnull))
+            stderr = IOBuffer()
+            @test !success(pipeline(`$(exe) --no-such-option`; stderr))
+            @test occursin("no-such-option", String(take!(stderr)))
+        end
+    end
+end
+
 if executor_available(UnprivilegedUserNamespacesExecutor)
     rootfs_dir = Sandbox.debian_rootfs()
     @testset "UnprivilegedUserNamespacesExecutor" begin
@@ -242,6 +255,15 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
             persist_root, userxattr = Sandbox.find_persist_dir_root(Sandbox.debian_rootfs(), dir_hints)
             @test persist_root != joinpath(dir, "non_existant")
         end
+    end
+
+    @testset "optional flags in executor commands" begin
+        exe = UnprivilegedUserNamespacesExecutor()
+        config = SandboxConfig(Dict("/" => rootfs_dir); persist=false)
+        @test "--shm-size" ∉ Sandbox.build_executor_command(exe, config, `/bin/true`).exec
+        config = SandboxConfig(Dict("/" => rootfs_dir); persist=false, shm_size="64M")
+        args = Sandbox.build_executor_command(exe, config, `/bin/true`).exec
+        @test args[findfirst(==("--shm-size"), args) + 1] == "64M"
     end
 
     @testset "mount ordering in executor commands" begin

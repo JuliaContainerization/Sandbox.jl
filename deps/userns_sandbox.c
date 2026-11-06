@@ -77,7 +77,8 @@ static int userxattr = 0;
 /*
  * We use this method to get /dev in shape.  If we're running as init, we need to
  * mount full-blown devtmpfs at /dev.  If we're just a sandbox, we only bindmount
- * /dev/{tty,null,urandom,pts,ptmx} into our root_dir.
+ * /dev/{tty,null,urandom,pts,ptmx} into our root_dir.  /dev/shm is not the host's:
+ * `mount_private()` mounts a fresh one from within the sandbox's IPC namespace.
  */
 static void mount_dev(const char * root_dir) {
   char path[PATH_MAX];
@@ -89,7 +90,10 @@ static void mount_dev(const char * root_dir) {
   bind_host_node(root_dir, "/dev/zero", FALSE);
   bind_host_node(root_dir, "/dev/random", FALSE);
   bind_host_node(root_dir, "/dev/urandom", FALSE);
-  bind_host_node(root_dir, "/dev/shm", FALSE);
+
+  // Create the mount point for `mount_private()`, which runs in the cloned child.
+  snprintf(path, sizeof(path), "%s/dev/shm", root_dir);
+  mkpath(path);
 
   // Bindmount the sysfs, but make it read-only
   bind_host_node(root_dir, "/sys", TRUE);
@@ -204,6 +208,102 @@ static void mount_the_world(const char * root_dir,
 }
 
 /*
+ * Mounts that belong to the namespaces of the cloned child rather than to the host,
+ * so they are made after `clone()` in both execution modes:
+ *   - a fresh tmpfs on /dev/shm, private to the sandbox like its IPC namespace;
+ *     its pages are charged to the memory cgroup of the processes that use them.
+ *   - a read-only cgroup2 mount on /sys/fs/cgroup, rooted at the cgroup the sandbox
+ *     was started in (the root of its cgroup namespace).  It covers the host's
+ *     writable hierarchy that came in with /sys, so the sandbox can read its own
+ *     limits (as /proc/self/cgroup says `0::/`) but cannot reach any other cgroup.
+ *     On hosts without a cgroup2 hierarchy at /sys/fs/cgroup there is no such view
+ *     to give, so the host's hierarchies are hidden behind an empty tmpfs instead.
+ */
+static void mount_private(const char * root_dir, const char * shm_size) {
+  char path[PATH_MAX];
+  char options[64];
+  int n;
+
+  snprintf(path, sizeof(path), "%s/dev/shm", root_dir);
+  if (shm_size != NULL) {
+    n = snprintf(options, sizeof(options), "mode=1777,size=%s", shm_size);
+  } else {
+    n = snprintf(options, sizeof(options), "mode=1777");
+  }
+  check(0 < n && n < sizeof(options));
+  if (verbose) {
+    fprintf(stderr, "--> Mounting tmpfs at %s (%s)\n", path, options);
+  }
+  check(0 == mount("tmpfs", path, "tmpfs", MS_NOSUID|MS_NODEV, options));
+
+  struct statfs cgroup_fs;
+  snprintf(path, sizeof(path), "%s/sys/fs/cgroup", root_dir);
+  if (statfs(path, &cgroup_fs) != 0) {
+    // No /sys/fs/cgroup on the host, so nothing to cover.
+    return;
+  }
+  unsigned long cgroup_flags = MS_NOSUID|MS_NODEV|MS_NOEXEC;
+  if (cgroup_fs.f_type == CGROUP2_SUPER_MAGIC) {
+    if (verbose) {
+      fprintf(stderr, "--> Mounting cgroup2 at %s (read-only)\n", path);
+    }
+    // The new mount shares its superblock with the host's mount it covers, which
+    // mount(2) refuses to stack directly (EBUSY), and the superblock is writable, so
+    // it cannot be asked for read-only either.  Mount it in the scratch space of the
+    // fresh /dev/shm, make that mount read-only, then move it into place.
+    char staging[PATH_MAX];
+    snprintf(staging, sizeof(staging), "%s/dev/shm/.cgroup", root_dir);
+    check(0 == mkdir(staging, 0700));
+    if (0 != mount("cgroup2", staging, "cgroup2", cgroup_flags, NULL)) {
+      fprintf(stderr, "ERROR: Failed to mount cgroup2: %s (errno %d)\n",
+              strerror(errno), errno);
+      _exit(1);
+    }
+    check(0 == mount(NULL, staging, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|cgroup_flags, NULL));
+    check(0 == mount(staging, path, NULL, MS_MOVE, NULL));
+    check(0 == rmdir(staging));
+  } else {
+    if (verbose) {
+      fprintf(stderr, "--> No cgroup2 hierarchy at %s, hiding it behind an empty tmpfs\n", path);
+    }
+    check(0 == mount("tmpfs", path, "tmpfs", MS_RDONLY|cgroup_flags, "size=4k,mode=0755"));
+  }
+}
+
+/*
+ * Moves into a nested user namespace (with a mount namespace) that maps only our own
+ * uid and gid.  The kernel locks every mount that is copied into a mount namespace
+ * owned by a less privileged user namespace: such mounts can no longer be unmounted
+ * on their own (which would reveal what they cover, such as the host's cgroup
+ * hierarchy under our cgroup2 mount) and their read-only, nosuid, nodev and noexec
+ * flags can no longer be cleared.
+ *
+ * The sandboxed processes have no capabilities over namespaces owned by the outer
+ * user namespace, so new PID, UTS and IPC namespaces are created along with it for
+ * them to own: as before, they may mount a procfs for their PID namespace (which a
+ * nested sandbox in privileged mode does), and set the hostname.  The PID namespace
+ * applies to our children: the next one becomes its init.  The cgroup namespace stays
+ * the outer one, which is what keeps the cgroup2 view rooted where it is.
+ */
+static void lock_sandbox() {
+  uid_t uid = geteuid();
+  gid_t gid = getegid();
+
+  if (verbose) {
+    fprintf(stderr, "--> Locking the sandbox in a nested user namespace\n");
+  }
+  if (0 != unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC)) {
+    fprintf(stderr, "ERROR: Failed to create the nested user namespace that locks the sandbox: %s (errno %d)\n",
+            strerror(errno), errno);
+    _exit(1);
+  }
+  // In privileged mode, `setuid()` reset our dumpability, which leaves our /proc
+  // entries owned by an unmapped root and keeps us from writing our own maps.
+  prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+  configure_user_namespace(getpid(), uid, gid, uid, gid);
+}
+
+/*
  * Sets up the chroot jail, then executes the target executable.
  */
 static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_argc, char **sandbox_argv, int *parent_pipe) {
@@ -231,9 +331,28 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   } else {
     check(0 == chroot(root_dir));
     if (verbose) {
-      fprintf(stderr, "--> chroot() used since pivot_root() errored with: [%d] %s, nested sandboxing unavailable\n", errno, strerror(errno));
+      fprintf(stderr, "--> chroot() used since pivot_root() errored with: [%d] %s; locking the sandbox will fail\n", errno, strerror(errno));
     }
   }
+
+  // All mounts are in place, so lock them before running anything.
+  lock_sandbox();
+
+  // Our next child is the init of the sandboxed processes' PID namespace; it reports
+  // their exit status to the parent itself.  We only pass signals on to it.
+  pid_t init_pid = fork();
+  if (init_pid != 0) {
+    check(init_pid != -1);
+    child_pid = init_pid;
+    setup_signal_forwarding();
+    while (waitpid(init_pid, &status, 0) == -1) {
+      check(errno == EINTR);
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+  }
+
+  // Give that PID namespace its own /proc, over the (now locked) one of ours.
+  mount_procfs("", geteuid(), getegid());
 
   // If we've got a directory to change to, do so, creating it if we need to
   if (new_cd) {
@@ -308,6 +427,7 @@ static void print_help() {
   fputs("[--persist <work_dir>] ", stderr);
   fputs("[--entrypoint <exe_path>] ", stderr);
   fputs("[--userxattr] ", stderr);
+  fputs("[--shm-size <size>] ", stderr);
   fputs("[--verbose] [--help] <cmd>\n", stderr);
   fputs("\nExample:\n", stderr);
   fputs("  mkdir -p /tmp/workspace\n", stderr);
@@ -369,6 +489,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
   gid_t dst_gid = 0;
 
   char * tmpfs_size = "1G"; // default value if the `--tmpfs-size` option is not provided
+  char * shm_size = NULL;   // size of /dev/shm; the tmpfs default (half of RAM) if not given
 
   // Parse out options
   while(1) {
@@ -383,6 +504,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
       {"uid",        required_argument, NULL, 'u'},
       {"gid",        required_argument, NULL, 'g'},
       {"tmpfs-size", required_argument, NULL, 't'},
+      {"shm-size",   required_argument, NULL, 's'},
       {"userxattr",  no_argument,       NULL, 'x'},
       {"hostname",   required_argument, NULL, 'H'},
       {0, 0, 0, 0}
@@ -396,10 +518,14 @@ int main(int sandbox_argc, char **sandbox_argv) {
       break;
 
     switch( c ) {
-      case '?':
       case 'h':
         print_help();
         return 0;
+      case '?':
+        // getopt already printed what was wrong; an option we don't know must not
+        // look like a successful run to a caller that expected it to take effect.
+        print_help();
+        return 1;
       case 'v':
         verbose = 1;
         fprintf(stderr, "verbose sandbox enabled (running in ");
@@ -505,6 +631,12 @@ int main(int sandbox_argc, char **sandbox_argv) {
           fprintf(stderr, "Parsed --tmpfs-size as \"%s\"\n", tmpfs_size);
         }
         break;
+      case 's':
+        shm_size = strdup(optarg);
+        if (verbose) {
+          fprintf(stderr, "Parsed --shm-size as \"%s\"\n", shm_size);
+        }
+        break;
       case 'H':
         hostname = strdup(optarg);
         if (verbose) {
@@ -571,8 +703,10 @@ int main(int sandbox_argc, char **sandbox_argv) {
     mount_the_world(sandbox_root, mounts, uid, gid, persist_dir, tmpfs_size);
   }
 
-  // We want to request a new PID space, a new mount space, and a new user space
-  int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | SIGCHLD;
+  // We want to request a new PID space, a new mount space, a new user space, and
+  // private hostname, IPC and cgroup namespaces.
+  int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWIPC |
+                    CLONE_NEWCGROUP | SIGCHLD;
   if ((child_pid = syscall(SYS_clone, clone_flags, 0, 0, 0, 0)) == 0) {
     // If we're in here, we have become the "child" process, within the container.
 
@@ -607,6 +741,14 @@ int main(int sandbox_argc, char **sandbox_argv) {
       // If we're in unprivileged container mode, mount the world now that we
       // have supreme cosmic power.
       mount_the_world(sandbox_root, mounts, dst_uid, dst_gid, persist_dir, tmpfs_size);
+    }
+    mount_private(sandbox_root, shm_size);
+
+    if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
+      // The rootfs was mounted before we entered this user namespace, so the kernel
+      // locked it to its parent, and `pivot_root()` refuses a locked mount.  A
+      // recursive bind of it made from in here is not locked itself.
+      check(0 == mount(sandbox_root, sandbox_root, NULL, MS_BIND|MS_REC, NULL));
     }
 
     // Set the hostname, if that's been requested

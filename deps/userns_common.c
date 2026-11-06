@@ -293,6 +293,9 @@ void bind_mount(const char *src, const char *dest, char read_only) {
   if (isdir(resolved_src)) {
     mkpath(dest);
   } else {
+    char dest_dirname[PATH_MAX];
+    strncpy(dest_dirname, dest, PATH_MAX);
+    mkpath(dirname(&dest_dirname[0]));
     touch(dest);
   }
 

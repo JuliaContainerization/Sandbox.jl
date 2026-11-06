@@ -15,6 +15,7 @@ using Test, LazyArtifacts, Sandbox
         @test config.stdout == Base.stdout
         @test config.stderr == Base.stderr
         @test config.hostname === nothing
+        @test config.shm_size === nothing
     end
 
     @testset "full options" begin
@@ -36,6 +37,7 @@ using Test, LazyArtifacts, Sandbox
             stdout = stdout,
             stderr = Base.devnull,
             hostname="sandy",
+            shm_size="256M",
         )
 
         # Test the old style API getting mapped to the new MountInfo API:
@@ -54,6 +56,7 @@ using Test, LazyArtifacts, Sandbox
         @test config.stdout == stdout
         @test config.stderr == Base.devnull
         @test config.hostname == "sandy"
+        @test config.shm_size == "256M"
     end
 
     @testset "copy constructor with stdio kwargs" begin
@@ -63,7 +66,8 @@ using Test, LazyArtifacts, Sandbox
             Dict("TEST_VAR" => "test_value");
             pwd = "/home",
             verbose = true,
-            hostname = "test-host"
+            hostname = "test-host",
+            shm_size = "1G",
         )
 
         # Test copying with modified stdout/stderr
@@ -82,6 +86,7 @@ using Test, LazyArtifacts, Sandbox
         @test config2.gid == config1.gid
         @test config2.tmpfs_size == config1.tmpfs_size
         @test config2.hostname == config1.hostname
+        @test config2.shm_size == config1.shm_size
         @test config2.verbose == config1.verbose
 
         # Check that stdio was modified

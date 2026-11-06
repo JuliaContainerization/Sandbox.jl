@@ -57,6 +57,13 @@ Sandbox executors require a configuration to set up the environment properly.
 
 - `hostname`: Set the hostname within the sandbox, defaults to the current hostname
 
+- `tmpfs_size`: Size of the tmpfs that holds changes to the rootfs when `persist` is
+  `false` (user namespace executors only), e.g. `"2G"`.
+
+- `shm_size`: Size of the sandbox's private `/dev/shm`, e.g. `"1G"`.
+  - Defaults to `nothing`, which leaves it at the executor's default (half of the
+    memory for the user namespace executors, 64 MB for Docker).
+
 - `verbose`: Set whether the sandbox construction process should be more or less verbose.
 """
 struct SandboxConfig
@@ -69,6 +76,7 @@ struct SandboxConfig
     uid::Cint
     gid::Cint
     tmpfs_size::Union{String, Nothing}
+    shm_size::Union{String, Nothing}
     hostname::Union{String, Nothing}
 
     stdin::AnyRedirectable
@@ -85,6 +93,7 @@ struct SandboxConfig
                            uid::Integer=0,
                            gid::Integer=0,
                            tmpfs_size::Union{String, Nothing}=nothing,
+                           shm_size::Union{String, Nothing}=nothing,
                            hostname::Union{String, Nothing}=nothing,
                            stdin::AnyRedirectable = Base.devnull,
                            stdout::AnyRedirectable = Base.stdout,
@@ -133,7 +142,7 @@ struct SandboxConfig
             push!(multiarch_formats, platform_qemu_registrations[interp_platforms[platform_idx]])
         end
 
-        return new(mounts, env, entrypoint, pwd, persist, collect(multiarch_formats), Cint(uid), Cint(gid), tmpfs_size, hostname, stdin, stdout, stderr, verbose)
+        return new(mounts, env, entrypoint, pwd, persist, collect(multiarch_formats), Cint(uid), Cint(gid), tmpfs_size, shm_size, hostname, stdin, stdout, stderr, verbose)
     end
 
     # Inner constructor that takes an existing SandboxConfig and allows modifying stdio
@@ -143,7 +152,7 @@ struct SandboxConfig
                            stderr::AnyRedirectable = config.stderr)
         return new(config.mounts, config.env, config.entrypoint, config.pwd,
                    config.persist, config.multiarch_formats, config.uid, config.gid,
-                   config.tmpfs_size, config.hostname, stdin, stdout, stderr, config.verbose)
+                   config.tmpfs_size, config.shm_size, config.hostname, stdin, stdout, stderr, config.verbose)
     end
 end
 

@@ -69,6 +69,7 @@ include("Docker.jl")
 include("Sandbox.jl")
 
 if Sys.islinux()
+    include("Isolation.jl")
     include("Nesting.jl")
     include("Multiarch.jl")
 end
