@@ -420,13 +420,18 @@ uint8_t mount_overlay(const char * const * lowers, size_t num_lowers, const char
 
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
   uint8_t ok = TRUE;
+  int saved_errno = 0;
   if (0 != mount("overlay", dest, "overlay", flags, opts)) {
+    saved_errno = errno;
     if (verbose) {
       fprintf(stderr, "----> mount(\"overlay\", \"%s\", \"overlay\", %lu, \"%s\") failed: %d (%s)\n", dest, flags, opts, errno, strerror(errno));
     }
     ok = FALSE;
   }
   free(opts);
+  if (!ok) {
+    errno = saved_errno;
+  }
   return ok;
 }
 
