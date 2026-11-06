@@ -23,7 +23,7 @@ int open_proc_file(pid_t pid, const char *file, int mode) {
   char path[PATH_MAX];
   int n = snprintf(path, sizeof(path), "/proc/%d/%s", pid, file);
   check(n >= 0 && n < sizeof(path));
-  int fd = open(path, mode);
+  int fd = open(path, mode | O_CLOEXEC);
   check(fd != -1);
   return fd;
 }
@@ -191,6 +191,7 @@ void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid,
   nbytes = snprintf(gidmap, sizeof(gidmap), "%d\t%d\t1", dst_gid, src_gid);
   check(nbytes > 0 && nbytes <= sizeof(gidmap));
   check(write(gidmap_fd, gidmap, nbytes) == nbytes);
+  close(gidmap_fd);
 }
 
 

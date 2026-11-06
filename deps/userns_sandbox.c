@@ -301,6 +301,13 @@ static void lock_sandbox() {
   // entries owned by an unmapped root and keeps us from writing our own maps.
   prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
   configure_user_namespace(getpid(), uid, gid, uid, gid);
+
+  // The sandboxed processes run as our user in this user namespace, so while we are
+  // dumpable they could open our fds (the status pipe) through /proc/1/fd of their
+  // PID namespace, whose init inherits this setting.  Their capabilities don't help
+  // them past it: those are checked against the user namespace that owns our memory,
+  // the launcher's, as we never exec.
+  prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
 /*
@@ -343,6 +350,7 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   pid_t init_pid = fork();
   if (init_pid != 0) {
     check(init_pid != -1);
+    close(parent_pipe[1]);
     child_pid = init_pid;
     setup_signal_forwarding();
     while (waitpid(init_pid, &status, 0) == -1) {
@@ -682,10 +690,11 @@ int main(int sandbox_argc, char **sandbox_argv) {
   // If we're running in one of the container modes, we're going to syscall() ourselves a
   // new, cloned process that is in a container process. We will use a pipe for synchronization.
   // The regular SIGSTOP method does not work because container-inits don't receive STOP or KILL
-  // signals from within their own pid namespace.
+  // signals from within their own pid namespace.  The pipes are close-on-exec, so that
+  // the sandboxed command cannot write a fake exit status to them.
   int child_pipe[2], parent_pipe[2];
-  check(0 == pipe(child_pipe));
-  check(0 == pipe(parent_pipe));
+  check(0 == pipe2(child_pipe, O_CLOEXEC));
+  check(0 == pipe2(parent_pipe, O_CLOEXEC));
 
   if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
     // We dissociate ourselves from the typical mount namespace.  This gives us the freedom
@@ -726,6 +735,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
     check(1 == write(parent_pipe[1], "X", 1));
     char buff = 0;
     check(sizeof(char) == read(child_pipe[0], (void *)&buff, sizeof(char)));
+    close(child_pipe[0]);
 
     if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
       // If we are in privileged container mode, let's go ahead and drop back
@@ -809,14 +819,13 @@ int main(int sandbox_argc, char **sandbox_argv) {
     return 1;
   }
 
-  // Receive termination signal
+  // The sandboxed executable's exit value is reported via the pipe.  The child only
+  // exits after the init that writes it, so the report is complete if it's there.
   uint32_t child_exit_code = -1;
-  check(sizeof(uint32_t) == read(parent_pipe[0], (void *)&child_exit_code, sizeof(uint32_t)));
-
-  // The child sandbox should alway exit cleanly, with a zero exit status.
-  // The sandboxed executable's exit value will be reported via the pipes
-  check(WIFEXITED(status));
-  check(WEXITSTATUS(status) == 0);
+  if (sizeof(uint32_t) != read(parent_pipe[0], (void *)&child_exit_code, sizeof(uint32_t))) {
+    fputs("ERROR: Sandbox exited without reporting the exit status of the command\n", stderr);
+    return 1;
+  }
 
   // We encode signal death as 256 + signal
   if (child_exit_code >= 256) {
