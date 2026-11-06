@@ -180,6 +180,32 @@ for mode in launcher_modes
                 run(mode == :sudo ? `sudo -n rm -rf $(persist)` : `chmod -R u+rwX $(persist)`)
             end
 
+            # The persist directory records how overlayfs's xattrs are kept, and a
+            # sandbox that can't read them that way refuses it
+            mktempdir() do dir
+                persist = joinpath(dir, "persist")
+                code, out, err = launch(mode, ``; options=`--persist $(persist)`)
+                @test code == 0
+                # (`userxattr` needs Linux 5.11, and real root does without it)
+                @test read(joinpath(persist, "xattrs"), String) in ("user\n", mode == :sudo ? "trusted\n" : "user\n")
+                @test launch(mode, ``; options=`--persist $(persist)`)[1] == 0
+                persist = joinpath(dir, "other")
+                mkdir(persist)
+                for (xattrs, ok) in ("bogus\n" => false, "trusted\n" => mode == :sudo,
+                                     "trusted-userns\n" => mode == :userns)
+                    write(joinpath(persist, "xattrs"), xattrs)
+                    code, out, err = launch(mode, ``; options=`--persist $(persist)`)
+                    @test (code == 0) == ok
+                    ok || @test occursin("can't read them", err)
+                end
+                # Changes that don't say how they were made
+                rm(joinpath(persist, "xattrs"))
+                code, out, err = launch(mode, ``; options=`--persist $(persist)`)
+                @test code == 125
+                @test occursin("no `xattrs`", err)
+                run(mode == :sudo ? `sudo -n rm -rf $(dir)/persist $(dir)/other` : `chmod -R u+rwX $(dir)`)
+            end
+
             # Overlays at different places keep their changes apart.  These two
             # destinations had the same 32-bit hash in the name of their state.
             mktempdir() do dir

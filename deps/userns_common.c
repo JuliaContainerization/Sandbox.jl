@@ -400,9 +400,11 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
   if (0 != mount("overlay", dest, "overlay", flags, opts)) {
+    int saved_errno = errno;
     if (verbose) {
       fprintf(stderr, "----> mount(\"overlay\", \"%s\", \"overlay\", %lu, \"%s\") failed: %d (%s)\n", dest, flags, opts, errno, strerror(errno));
     }
+    errno = saved_errno;
     return FALSE;
   }
 

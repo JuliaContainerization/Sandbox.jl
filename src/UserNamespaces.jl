@@ -208,11 +208,8 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
             exe.persistence_dir = mktempdir(persist_root)
             exe.userxattr = userxattr
         end
+        # The launcher picks `userxattr` itself.
         append!(cmd_string, ["--persist", exe.persistence_dir])
-
-        if exe.userxattr
-            push!(cmd_string, "--userxattr")
-        end
     end
 
     # For each platform requested by `multiarch`, ensure its matching interpreter is registered.
