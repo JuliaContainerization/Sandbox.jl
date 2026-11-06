@@ -310,16 +310,36 @@ static int open_dest(int root_fd, const struct op *op, mode_t create) {
   return fd;
 }
 
+/*
+ * The name of the directories that hold an overlay's changes: its destination, with `/`
+ * and `%` escaped.  Unlike a hash, that can't be the same for two destinations, and it
+ * can't be "rootfs", the rootfs's.
+ */
+static void state_name(char *name, const char *dest) {
+  size_t n = 0;
+  for (const char *c = dest; *c != '\0'; c++) {
+    const char *escaped = *c == '/' ? "%2F" : *c == '%' ? "%25" : NULL;
+    size_t len = escaped ? 3 : 1;
+    if (n + len > NAME_MAX) {
+      fprintf(stderr, "ERROR: Failed to mount an overlay at '%s': the destination is too long\n", dest);
+      _exit(EXIT_SANDBOX_FAILED);
+    }
+    memcpy(name + n, escaped ? escaped : c, len);
+    n += len;
+  }
+  name[n] = '\0';
+}
+
 static void mount_overlay_op(int root_fd, const struct op *op, const char *work_dir,
                              uid_t uid, gid_t gid) {
-  char lower[FD_PATH_SIZE], path[FD_PATH_SIZE], bname[PATH_MAX];
+  char lower[FD_PATH_SIZE], path[FD_PATH_SIZE], name[NAME_MAX + 1];
   fd_path(lower, op->src_fd);
   int fd = open_dest(root_fd, op, S_IFDIR);
   fd_path(path, fd);
   // Each overlay keeps its changes in a directory named after its destination, so that
   // a later run sees them at the same place.
-  hashed_basename(bname, op->dest);
-  check(TRUE == mount_overlay(lower, path, bname, work_dir, userxattr, overlay_flags));
+  state_name(name, op->dest);
+  check(TRUE == mount_overlay(lower, path, name, work_dir, userxattr, overlay_flags));
   close(fd);
 
   // Look the destination up again, to get the overlay rather than what it covers.
