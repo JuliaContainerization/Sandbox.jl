@@ -271,6 +271,39 @@ static void mount_private(const char * root_dir, const char * shm_size) {
 }
 
 /*
+ * Moves into a nested user namespace (with a mount namespace) that maps only our own
+ * uid and gid.  The kernel locks every mount that is copied into a mount namespace
+ * owned by a less privileged user namespace: such mounts can no longer be unmounted
+ * on their own (which would reveal what they cover, such as the host's cgroup
+ * hierarchy under our cgroup2 mount) and their read-only, nosuid, nodev and noexec
+ * flags can no longer be cleared.
+ *
+ * The sandboxed processes have no capabilities over namespaces owned by the outer
+ * user namespace, so new PID, UTS and IPC namespaces are created along with it for
+ * them to own: as before, they may mount a procfs for their PID namespace (which a
+ * nested sandbox in privileged mode does), and set the hostname.  The PID namespace
+ * applies to our children: the next one becomes its init.  The cgroup namespace stays
+ * the outer one, which is what keeps the cgroup2 view rooted where it is.
+ */
+static void lock_sandbox() {
+  uid_t uid = geteuid();
+  gid_t gid = getegid();
+
+  if (verbose) {
+    fprintf(stderr, "--> Locking the sandbox in a nested user namespace\n");
+  }
+  if (0 != unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC)) {
+    fprintf(stderr, "ERROR: Failed to create the nested user namespace that locks the sandbox: %s (errno %d)\n",
+            strerror(errno), errno);
+    _exit(1);
+  }
+  // In privileged mode, `setuid()` reset our dumpability, which leaves our /proc
+  // entries owned by an unmapped root and keeps us from writing our own maps.
+  prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+  configure_user_namespace(getpid(), uid, gid, uid, gid);
+}
+
+/*
  * Sets up the chroot jail, then executes the target executable.
  */
 static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_argc, char **sandbox_argv, int *parent_pipe) {
@@ -298,9 +331,28 @@ static int sandbox_main(const char * root_dir, const char * new_cd, int sandbox_
   } else {
     check(0 == chroot(root_dir));
     if (verbose) {
-      fprintf(stderr, "--> chroot() used since pivot_root() errored with: [%d] %s, nested sandboxing unavailable\n", errno, strerror(errno));
+      fprintf(stderr, "--> chroot() used since pivot_root() errored with: [%d] %s; locking the sandbox will fail\n", errno, strerror(errno));
     }
   }
+
+  // All mounts are in place, so lock them before running anything.
+  lock_sandbox();
+
+  // Our next child is the init of the sandboxed processes' PID namespace; it reports
+  // their exit status to the parent itself.  We only pass signals on to it.
+  pid_t init_pid = fork();
+  if (init_pid != 0) {
+    check(init_pid != -1);
+    child_pid = init_pid;
+    setup_signal_forwarding();
+    while (waitpid(init_pid, &status, 0) == -1) {
+      check(errno == EINTR);
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+  }
+
+  // Give that PID namespace its own /proc, over the (now locked) one of ours.
+  mount_procfs("", geteuid(), getegid());
 
   // If we've got a directory to change to, do so, creating it if we need to
   if (new_cd) {
@@ -691,6 +743,13 @@ int main(int sandbox_argc, char **sandbox_argv) {
       mount_the_world(sandbox_root, mounts, dst_uid, dst_gid, persist_dir, tmpfs_size);
     }
     mount_private(sandbox_root, shm_size);
+
+    if (execution_mode == PRIVILEGED_CONTAINER_MODE) {
+      // The rootfs was mounted before we entered this user namespace, so the kernel
+      // locked it to its parent, and `pivot_root()` refuses a locked mount.  A
+      // recursive bind of it made from in here is not locked itself.
+      check(0 == mount(sandbox_root, sandbox_root, NULL, MS_BIND|MS_REC, NULL));
+    }
 
     // Set the hostname, if that's been requested
     if (hostname != NULL) {

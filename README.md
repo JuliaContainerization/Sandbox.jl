@@ -55,6 +55,24 @@ using Sandbox
 Sandbox.disable_apparmor_userns_restrictions()
 ```
 
+## What the user namespaces executor isolates
+
+A sandbox gets its own PID, mount, user, UTS (hostname), IPC and cgroup namespaces; it shares
+the host's network.  Inside it:
+
+* `/proc` is a fresh procfs that shows only the sandbox's processes, and `/dev/shm` is a fresh
+  tmpfs (sized with `shm_size`) instead of the host's.
+* `/sys` is the host's, read-only.  `/sys/fs/cgroup` shows only the cgroup the sandbox was
+  started in (and its children), read-only, so programs can read their own limits but not
+  reach other cgroups.  That they cannot change their own limits either (through a cgroup2
+  mount of a cgroup namespace of their own) also needs the host to mount cgroup2 with
+  `nsdelegate`, as systemd does.  On hosts without cgroup v2, `/sys/fs/cgroup` is empty.
+* The sandboxed processes run in a nested user namespace in which every mount made while
+  setting up the sandbox is locked: they cannot be unmounted to reveal what they cover, nor
+  made writable.  They are root there (unless `uid` says otherwise), own their PID, UTS and
+  IPC namespaces, and can create namespaces and mount filesystems of their own, so
+  sandboxes can be nested.
+
 ## Getting more rootfs images
 
 To use more interesting rootfs images, you can either create your own using tools such as [`debootstrap`](https://wiki.debian.org/Debootstrap) or you can pull one from docker by using the `pull_docker_image()` function defined within this package.  See the [`contrib`](contrib/) directory for examples of both.
