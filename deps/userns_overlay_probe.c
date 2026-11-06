@@ -151,7 +151,7 @@ int main(int sandbox_argc, char **sandbox_argv) {
     }
 
     // Mount an overlay filesystem with the probe directory as the "work" directory.
-    uint8_t ret = mount_overlay(rootfs_dir, rootfs_dir, "probe", probe_dir, userxattr);
+    uint8_t ret = mount_overlay(rootfs_dir, rootfs_dir, "probe", probe_dir, userxattr, 0);
 
     if (ret == TRUE) {
       // Test directory renaming (this ensures that our kernel can handle this combination

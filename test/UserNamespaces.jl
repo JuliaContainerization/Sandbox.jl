@@ -131,6 +131,14 @@ end
 
         # Verify the regular file got chmod'd
         @test filemode(joinpath(tasks_dir, "regular.txt")) & 0o777 == 0o777
+
+        # Symlinks are not followed out of the tree
+        victim = joinpath(dir, "victim")
+        touch(victim)
+        chmod(victim, 0o600)
+        symlink(victim, joinpath(tasks_dir, "link"))
+        Sandbox.chmod_recursive(joinpath(dir, "upper"), 0o777, false)
+        @test filemode(victim) & 0o777 == 0o600
     end
 end
 
@@ -143,6 +151,21 @@ if should_build_local_sandbox && UserNSSandbox_jll.is_available()
             stderr = IOBuffer()
             @test !success(pipeline(`$(exe) --no-such-option`; stderr))
             @test occursin("no-such-option", String(take!(stderr)))
+        end
+
+        # Failures of the sandbox itself exit with 125, so that they can't be mistaken
+        # for the command failing
+        exe = UserNSSandbox_jll.sandbox_path
+        rootfs = Sandbox.debian_rootfs()
+        for args in [`--no-such-option --rootfs $(rootfs) /bin/true`,
+                     `--rootfs $(rootfs)`,
+                     `/bin/true`,
+                     `--rootfs $(rootfs) --mount relative:/mnt /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp:/mnt:bogus /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp /bin/true`,
+                     `--rootfs /does/not/exist /bin/true`]
+            p = run(pipeline(ignorestatus(`$(exe) $(args)`); stderr=devnull))
+            @test p.exitcode == 125
         end
     end
 end

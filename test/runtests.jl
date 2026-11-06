@@ -70,6 +70,7 @@ include("Sandbox.jl")
 
 if Sys.islinux()
     include("Isolation.jl")
+    include("Lifecycle.jl")
     include("Nesting.jl")
     include("Multiarch.jl")
 end

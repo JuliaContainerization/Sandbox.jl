@@ -19,11 +19,11 @@ if should_build_local_sandbox && UserNSSandbox_jll.is_available() &&
 end
 
 # Run a shell script in the sandbox, returning `(success, stdout, stderr)`.
-function sandbox_sh(executor, script; mounts=Dict{String,MountInfo}(), kwargs...)
+function sandbox_sh(executor, script; mounts=Dict{String,MountInfo}(), env=Dict{String,String}(), kwargs...)
     stdout, stderr = IOBuffer(), IOBuffer()
     config = SandboxConfig(
         Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
-        Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        Dict("PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", env...);
         stdout, stderr, persist=false, kwargs...,
     )
     ok = with_executor(executor) do exe
@@ -36,6 +36,7 @@ host_cgroup2 = any(eachline("/proc/self/mounts")) do line
     fields = split(line)
     return fields[2] == "/sys/fs/cgroup" && fields[3] == "cgroup2"
 end
+host_sys_submounts = any(l -> startswith(split(l)[2], "/sys/"), eachline("/proc/self/mounts"))
 host_cgroup_dir() = "/sys/fs/cgroup" * replace(readline("/proc/self/cgroup"), r"^0::" => "")
 
 # A cgroup delegated to us, laid out like a job scheduler's: the scheduler in `sup/`, the
@@ -82,6 +83,142 @@ for executor in userns_executors
                 @test ok
                 @test out == "great success"
                 @test isempty(err)
+            end
+        end
+
+        @testset "map destinations are resolved in the rootfs" begin
+            mktempdir() do dir
+                write(joinpath(dir, "note.txt"), "great success")
+                note = MountInfo(joinpath(dir, "note.txt"), MountType.ReadOnly)
+                host_target = joinpath(dir, "created_by_sandbox")
+                stdout, stderr = IOBuffer(), IOBuffer()
+                config(mounts...) = SandboxConfig(
+                    Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
+                    Dict("PATH" => "/usr/bin:/bin");
+                    stdout, stderr, persist=true,
+                )
+                with_executor(executor) do exe
+                    # Symlinks left behind by an earlier run: one pointing at the host
+                    # path, a dangling relative one like Ubuntu's /etc/resolv.conf, and
+                    # one to the root
+                    @test success(exe, config(), `/bin/sh -c """
+                        ln -s $(host_target) /escape
+                        ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+                        ln -s / /root_alias
+                        """`)
+                    @test success(exe, config("/escape" => note, "/etc/resolv.conf" => note),
+                                  `/bin/sh -c "cat /escape; cat /etc/resolv.conf"`)
+                    # A map cannot replace the root, even with a working rootfs
+                    @test !success(exe, config("/root_alias" => MountInfo(Sandbox.debian_rootfs(), MountType.ReadOnly)),
+                                   `/bin/true`)
+                end
+                @test String(take!(stdout)) == "great success"^2
+                @test occursin("it is the root of the sandbox", String(take!(stderr)))
+                @test !ispath(host_target)
+            end
+        end
+
+        @testset "maps of any host path" begin
+            # Without `persist`, the rootfs changes go in a tmpfs, which must not hide
+            # a host directory from the maps
+            ok, out, err = sandbox_sh(executor, "test -x /hostbin/sh && echo found";
+                mounts=Dict("/hostbin" => MountInfo("/bin", MountType.ReadOnly)))
+            @test ok
+            @test out == "found\n"
+        end
+
+        @testset "no mount propagation from the host" begin
+            # None of the sandbox's mounts is a peer or slave of a host mount
+            ok, out, err = sandbox_sh(executor, "grep -cE ' (shared|master):' /proc/self/mountinfo")
+            @test out == "0\n"
+        end
+
+        # SANDBOX_MOUNT_SETATTR=0 has the launcher do without mount_setattr(2), as on
+        # kernels before 5.12
+        @testset "read-only maps include their submounts (mount_setattr: $(setattr))" for setattr in ("1", "0")
+            env = Dict("SANDBOX_MOUNT_SETATTR" => setattr)
+            # mounts below `dir` that are not read-only
+            writable(dir) = "awk '(\$2 == \"$(dir)\" || \$2 ~ \"^$(dir)/\") && \$4 !~ /^ro(,|\$)/' /proc/self/mounts"
+            ok, out, err = sandbox_sh(executor, writable("/sys"); env)
+            @test ok
+            @test out == ""
+
+            if host_sys_submounts
+                ok, out, err = sandbox_sh(executor, """
+                    grep -c ' /hostsys/' /proc/self/mounts
+                    $(writable("/hostsys"))
+                    """; env, mounts=Dict("/hostsys" => MountInfo("/sys", MountType.ReadOnly)))
+                @test ok
+                @test parse(Int, readline(IOBuffer(out))) > 0
+                @test countlines(IOBuffer(out)) == 1
+            end
+
+            # Nested mounts at a path that /proc/self/mountinfo shows longer than
+            # PATH_MAX, as it escapes spaces (mounting them on the host takes root)
+            if PrivilegedUserNamespacesExecutor in userns_executors
+                mktempdir() do dir
+                    rel = joinpath(fill(" "^64, 20)...)
+                    outer = joinpath(dir, rel)
+                    inner = joinpath(outer, "inner")
+                    mkpath(outer)
+                    run(`sudo -n mount -t tmpfs -o mode=1777 none $(outer)`)
+                    try
+                        mkdir(inner)
+                        run(`sudo -n mount -t tmpfs -o mode=1777 none $(inner)`)
+                        for path in (joinpath("/m", rel, "x"), joinpath("/m", rel, "inner", "x"))
+                            ok, out, err = sandbox_sh(executor, "touch '$(path)'"; env,
+                                mounts=Dict("/m" => MountInfo(dir, MountType.ReadOnly)))
+                            @test !ok
+                            @test occursin("Read-only file system", err)
+                        end
+                    finally
+                        run(`sudo -n umount -R $(outer)`)
+                    end
+                end
+            end
+        end
+
+        @testset "no device nodes or setuid in the image" begin
+            # A world-writable device node, as an image could contain (making one
+            # takes root, which we have if the privileged executor is tested)
+            if PrivilegedUserNamespacesExecutor in userns_executors
+                mktempdir() do dir
+                    node = joinpath(dir, "null")
+                    run(`sudo -n mknod -m 666 $(node) c 1 3`)
+                    try
+                        ok, out, err = sandbox_sh(executor, "echo > /image/null";
+                            mounts=Dict("/image" => MountInfo(dir, MountType.Overlayed)))
+                        @test !ok
+                        @test occursin("Permission denied", err)
+                    finally
+                        run(`sudo -n rm $(node)`)
+                    end
+                end
+            end
+            ok, out, err = sandbox_sh(executor, "grep -E ' / ' /proc/self/mounts | tail -n 1")
+            @test ok
+            @test issubset(["nodev", "nosuid"], split(split(out)[4], ','))
+        end
+
+        # Only for callers that do not have root's identity themselves
+        if PrivilegedUserNamespacesExecutor in userns_executors &&
+           Sandbox.getuid() != 0 && Sandbox.getgid() != 0
+            @testset "no supplementary groups of root" begin
+                # A host file that only root and its group can read
+                mktempdir() do dir
+                    secret = joinpath(dir, "secret")
+                    write(secret, "secret")
+                    run(`sudo -n chown root:root $(secret)`)
+                    run(`sudo -n chmod 640 $(secret)`)
+                    try
+                        ok, out, err = sandbox_sh(executor, "cat /m/secret";
+                            mounts=Dict("/m" => MountInfo(dir, MountType.ReadOnly)))
+                        @test !ok
+                        @test occursin("Permission denied", err)
+                    finally
+                        run(`sudo -n rm $(secret)`)
+                    end
+                end
             end
         end
 

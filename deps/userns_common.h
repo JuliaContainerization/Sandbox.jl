@@ -40,7 +40,7 @@
 #include <linux/limits.h>
 #include <getopt.h>
 #include <byteswap.h>
-#include <mntent.h>
+#include <poll.h>
 #include <ftw.h>
 
 #ifndef CGROUP2_SUPER_MAGIC
@@ -51,6 +51,13 @@
 #define TRUE 1
 #define FALSE 0
 #define TRUEFALSE_EXITCODE(x) ((x) == TRUE ? 0 : 1)
+
+/* Exit codes that tell our own failures apart from the command's, as chosen by `env`,
+   `chroot` and container runtimes: the sandbox could not be set up, or the command
+   could not be executed or found. */
+#define EXIT_SANDBOX_FAILED 125
+#define EXIT_CANNOT_EXECUTE 126
+#define EXIT_NOT_FOUND 127
 extern unsigned char verbose;
 extern pid_t child_pid;
 
@@ -59,18 +66,23 @@ extern pid_t child_pid;
 void _check(int ok, const char * file, int line);
 #define check(ok) _check(ok, __FILE__, __LINE__)
 int open_proc_file(pid_t pid, const char *file, int mode);
-void touch(const char * path);
 void mkpath(const char * dir);
 int isdir(const char * path);
-int islink(const char * path);
 void rmrf(const char * path);
 void hashed_basename(char *output, const char *path);
-void signal_passthrough(int sig);
+
+/* Paths inside the sandbox */
+#define FD_PATH_SIZE 32
+void fd_path(char *buf, int fd);
+int open_root(const char *root_dir);
+int open_in_root(int root_fd, const char *path, mode_t create);
+int open_in_root_or_die(int root_fd, const char *path, mode_t create);
 void setup_signal_forwarding();
 
 /* User namespaces */
 void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid, uid_t dst_uid, gid_t dst_gid);
-uint8_t mount_overlay(const char * src, const char * dest, const char * bname, const char * work_dir, uint8_t userxattr);
+uint8_t mount_overlay(const char * src, const char * dest, const char * bname, const char * work_dir, uint8_t userxattr, unsigned long flags);
 void mount_procfs(const char * root_dir, uid_t uid, gid_t gid);
-void bind_mount(const char *src, const char *dest, char read_only);
-void bind_host_node(const char *root_dir, const char *name, char read_only);
+void make_readonly(int fd, const char *dest);
+void bind_mount(int root_fd, const char *src, const char *dest, char read_only);
+void bind_host_node(int root_fd, const char *name, char read_only);
