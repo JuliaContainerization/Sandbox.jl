@@ -638,9 +638,15 @@ static void mount_the_world(uid_t uid, gid_t gid) {
     fprintf(stderr, "--> Creating overlay workdir at %s\n", work_dir);
   }
   if (persist_dir == NULL) {
-    // tmpfs has user xattrs only since Linux 6.6.  Without them, and without root, the
-    // overlays get by without xattrs, which matters less for changes thrown away.
-    check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, 0, overlay_flags));
+    // Real root sets trusted xattrs on a tmpfs.  Anyone else needs `userxattr`, which a
+    // tmpfs supports since Linux 6.6; on older kernels the overlays get by without them,
+    // as without the option.
+    userxattr = !in_initial_user_namespace();
+    if (TRUE != mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, userxattr, overlay_flags)) {
+      check(errno == EINVAL && userxattr);
+      userxattr = 0;
+      check(TRUE == mount_overlay(lower_dir, sandbox_root, "rootfs", work_dir, 0, overlay_flags));
+    }
   } else {
     mount_persisted_root(lower_dir, work_dir);
   }

@@ -227,6 +227,20 @@ for mode in launcher_modes
                 run(mode == :sudo ? `sudo -n rm -rf $(persist)` : `chmod -R u+rwX $(persist)`)
             end
 
+            # A directory deleted and created again hides what the lower layer has in it,
+            # which takes xattrs, also in the tmpfs without `--persist` (whose user xattrs
+            # need Linux 6.6 without root)
+            kernel = something(tryparse(VersionNumber, first(split(readchomp(`uname -r`), '-'))), v"0")
+            if mode == :sudo || kernel >= v"6.6"
+                mktempdir() do dir
+                    lower = joinpath(dir, "lower")
+                    mkpath(joinpath(lower, "d"))
+                    write(joinpath(lower, "d", "f"), "f")
+                    code, out, err = launch(mode, `--overlay $(lower) /o`, "rm -r /o/d && mkdir /o/d && ls -A /o/d && echo ok")
+                    @test (code, out) == (0, "ok\n")
+                end
+            end
+
             # Overlays at different places keep their changes apart.  These two
             # destinations had the same 32-bit hash in the name of their state.
             mktempdir() do dir
