@@ -166,9 +166,8 @@ int main(int sandbox_argc, char **sandbox_argv) {
           fprintf(stderr, "----> rename(\"%s\", \"%s\") failed: %d (%s)\n", move_dir_src, move_dir_dst, errno, strerror(errno));
         }
         ret = FALSE;
-      }
-      if (verbose) {
-        fprintf(stderr, "----> rename(\"%s\", \"%s\") passed: %d (%s)\n", move_dir_src, move_dir_dst, errno, strerror(errno));
+      } else if (verbose) {
+        fprintf(stderr, "----> rename(\"%s\", \"%s\") passed\n", move_dir_src, move_dir_dst);
       }
     }
 
