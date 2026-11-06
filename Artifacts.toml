@@ -56,22 +56,22 @@ lazy = true
 
 [[qemu-aarch64]]
 arch = "x86_64"
-git-tree-sha1 = "e35008c8e38ee71e3e4c9c2b4ad472d37665fa17"
+git-tree-sha1 = "62f26d4981ecd4613d371e6ee177885ff1e3552a"
 lazy = true
 os = "linux"
 
     [[qemu-aarch64.download]]
-    sha256 = "c83bf89f81d142dd258a0325f7ab9dbe197490d3f0f0816b3eb9ddac1ceaf4f0"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-aarch64-static_amd64.tgz"
+    sha256 = "c234938816b213b601a432cc09f678923919e9ca58907fbd07e8dc103820063d"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-aarch64_amd64.tgz"
 [[qemu-aarch64]]
 arch = "aarch64"
-git-tree-sha1 = "1e8dc9efe0e04fdb232328d059c7bb83fba966bc"
+git-tree-sha1 = "d982d46bb2fa90dc7bd49d1ff579eb78c1262953"
 lazy = true
 os = "linux"
 
     [[qemu-aarch64.download]]
-    sha256 = "b4c723c38a372b0297c1e81d9b59212282e4728196985ce7f0367d0713dc661e"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-aarch64-static_arm64v8.tgz"
+    sha256 = "a3af95f664566fd2dc8c4ab2cbc39219cb1668079a54a771c8b87e09b18ea5d3"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-aarch64_arm64v8.tgz"
 [[qemu-aarch64]]
 arch = "armv7l"
 call_abi = "eabihf"
@@ -84,108 +84,108 @@ os = "linux"
     url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-aarch64-static_arm32v7.tgz"
 [[qemu-aarch64]]
 arch = "powerpc64le"
-git-tree-sha1 = "0e4aba704dd70bbe9aedf4c66faf5d346547cfa3"
+git-tree-sha1 = "fd8d565f4e69077dcda2d9972e51bd3f4cb9961c"
 lazy = true
 os = "linux"
 
     [[qemu-aarch64.download]]
-    sha256 = "49d02309ada4028566efd075a18abedceff94102f5c34f6a7f9a35988f9f2e48"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-aarch64-static_ppc64le.tgz"
+    sha256 = "8ff6064fb1f287a452287806608e313881da799bb9ceacada8ce8bb75fc6e2db"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-aarch64_ppc64le.tgz"
 
 [[qemu-arm]]
 arch = "x86_64"
-git-tree-sha1 = "cc5e763bd0383fb5030e2846f72fcdd42f426079"
+git-tree-sha1 = "0ff38dd139b08f9cafedd846c7acf7ca4516c25a"
 lazy = true
 os = "linux"
 
     [[qemu-arm.download]]
-    sha256 = "338e80f422da2f1ce391ff44a07f3091aa3669caeef36c871f0acfdea6a0ae49"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-arm-static_amd64.tgz"
+    sha256 = "e78ccb3fc25d508b95485b5a28e2d68edc588476a8390b9a5299efb0ab7a0d04"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-arm_amd64.tgz"
 [[qemu-arm]]
 arch = "aarch64"
-git-tree-sha1 = "4584318d303b0215132c046893971eb8815836c6"
+git-tree-sha1 = "262870a1f3c4a692e48ae95d407dfe7a73b38f5c"
 lazy = true
 os = "linux"
 
     [[qemu-arm.download]]
-    sha256 = "cafdcb659e581a587182030cbb2e2910d7a1b8bba482a38fd2fe6389691d045d"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-arm-static_arm64v8.tgz"
+    sha256 = "40af737b88f26467a2891e991913a5dbc20f429f1a23b5a0cec76c7405ad3b31"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-arm_arm64v8.tgz"
 [[qemu-arm]]
 arch = "armv7l"
 call_abi = "eabihf"
-git-tree-sha1 = "ebd96913b6ea99524cf278ef05355e7476b33c63"
+git-tree-sha1 = "e485e88603cb1afa751a4eb0c07ede915d48ea00"
 lazy = true
 os = "linux"
 
     [[qemu-arm.download]]
-    sha256 = "78746fddd2cbc6f6b93da0140545ce9bdb41e3be1ca3a8cd8afafcaf5e6b84ee"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-arm-static_arm32v7.tgz"
+    sha256 = "96c20d1d0303de74e562c4b4f638593fecfda9d090a7c781a2e767738056c2c8"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-arm_arm32v7.tgz"
 [[qemu-arm]]
 arch = "powerpc64le"
-git-tree-sha1 = "e3aa9d8f1c5ca1b91bd4ae8f44694139f8cb58d4"
+git-tree-sha1 = "d5411c02a580883b346efe1121137fed8c2bebb4"
 lazy = true
 os = "linux"
 
     [[qemu-arm.download]]
-    sha256 = "c2c2685410cec3b66378a2b03f0d2f5cfac799dd171658a672e27774eb09a26b"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-arm-static_ppc64le.tgz"
+    sha256 = "de5841202ab19c401631a80983ac2ae999431e3646413e58b4213b66331ff5e2"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-arm_ppc64le.tgz"
 
 [[qemu-i386]]
 arch = "x86_64"
-git-tree-sha1 = "9ddc7fc256b2a85facf877196721917235df051b"
+git-tree-sha1 = "f609233b77e7b7c70439a653be32b41e26a98e96"
 lazy = true
 os = "linux"
 
     [[qemu-i386.download]]
-    sha256 = "8daddbf18f11e871df86ecced50f6942cfbc419e58c3e5c03c5f581ea933b703"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-i386-static_amd64.tgz"
+    sha256 = "a352debc7bd15422ba310eb7a2e95ca6bae31c2bf07f7a0ef7abb3f367b2fb63"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-i386_amd64.tgz"
 [[qemu-i386]]
 arch = "aarch64"
-git-tree-sha1 = "efb9b46225c916dd63319fb1035d97b6d48ed327"
+git-tree-sha1 = "f34f246be1f708013f7038bddbb39ac06b457dea"
 lazy = true
 os = "linux"
 
     [[qemu-i386.download]]
-    sha256 = "3b873f1d8ee35e8918bb3bf46617a45d0c5f2f3a0e44dccd6aff6e6beadd986a"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-i386-static_arm64v8.tgz"
+    sha256 = "47ec4b1a18888e4b6c6451157f4187de864d50a9485b0fb09482d7e57dcb475f"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-i386_arm64v8.tgz"
 [[qemu-i386]]
 arch = "armv7l"
 call_abi = "eabihf"
-git-tree-sha1 = "be1c6999815ae41586d617d013679efe85773698"
+git-tree-sha1 = "5545d6dbf80a3adaa30eb08538f84b87dedebed6"
 lazy = true
 os = "linux"
 
     [[qemu-i386.download]]
-    sha256 = "e4d5c5a68e663af1331e8ed48b0e19da687d9787f90f30eb8d390bb007cf11ae"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-i386-static_arm32v7.tgz"
+    sha256 = "295e3a829960ac8e73bbc7e3d6af80c7969f8d555e3b5e37a521fbe22fedecf8"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-i386_arm32v7.tgz"
 [[qemu-i386]]
 arch = "powerpc64le"
-git-tree-sha1 = "e654eb5edbfc577e389fafde1bc24c0b3d3e8172"
+git-tree-sha1 = "0aff9cfcb17676cffa69761d85f2736049de179e"
 lazy = true
 os = "linux"
 
     [[qemu-i386.download]]
-    sha256 = "e4ec15af65edaf88421cd351bd2ff83d51adebe37228d3e29092b8bbed2be98f"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-i386-static_ppc64le.tgz"
+    sha256 = "a1c7e26bd55dbfbfd90099cbe3750e38a8c4cf1f6affc066f047bd9aee069fbf"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-i386_ppc64le.tgz"
 
 [[qemu-ppc64le]]
 arch = "x86_64"
-git-tree-sha1 = "80ba72c58ad50c856304e160b9e20dc6a6960652"
+git-tree-sha1 = "e9fbb260eaa4ee96d5aaf83cf94f7c672b154385"
 lazy = true
 os = "linux"
 
     [[qemu-ppc64le.download]]
-    sha256 = "d97277890cb3513935262a02218a66f67fbad8d63715f599ca36e838b1b2b360"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-ppc64le-static_amd64.tgz"
+    sha256 = "fece638c7c60083cab122eeeff23287d82eedbc2643231fdff2d6196d58e6906"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-ppc64le_amd64.tgz"
 [[qemu-ppc64le]]
 arch = "aarch64"
-git-tree-sha1 = "42320d44ebbf7e6cbba0690fb20c099164135a67"
+git-tree-sha1 = "b002d9fe6ab159857b7b2f028e3d383e86b1a15a"
 lazy = true
 os = "linux"
 
     [[qemu-ppc64le.download]]
-    sha256 = "a1023fca3b5172494df1b29f2a0b51857f621c7e5a9e9154f3f962fa5c5852d1"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-ppc64le-static_arm64v8.tgz"
+    sha256 = "bdc8a4af7d5f1fdf120c4ff4a09e7f8bb55b3ebaccb6bf05ac273ab619150941"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-ppc64le_arm64v8.tgz"
 [[qemu-ppc64le]]
 arch = "armv7l"
 call_abi = "eabihf"
@@ -198,32 +198,32 @@ os = "linux"
     url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-ppc64le-static_arm32v7.tgz"
 [[qemu-ppc64le]]
 arch = "powerpc64le"
-git-tree-sha1 = "229cb21bd293ec774343a4c58e52c4eae4291a00"
+git-tree-sha1 = "4ee5082ad7b0f53201ab9049dc7bd5bfd277a6e7"
 lazy = true
 os = "linux"
 
     [[qemu-ppc64le.download]]
-    sha256 = "5e685f388546da1fc140934fa9886d8b077e9bce90d1cb1a098506cca18a9eea"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-ppc64le-static_ppc64le.tgz"
+    sha256 = "48df7881128acee1d17782800d6e70cb637e1fe3baf3e14b3fa226649a4f23ad"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-ppc64le_ppc64le.tgz"
 
 [[qemu-x86_64]]
 arch = "x86_64"
-git-tree-sha1 = "4700fc8a9b0449c05f890f444f854b00dfdb34a2"
+git-tree-sha1 = "3cfb36854f35ee517906ae53687f0f16aff7e1cc"
 lazy = true
 os = "linux"
 
     [[qemu-x86_64.download]]
-    sha256 = "60dfecc8d9c4937bae782b927caed430766c8b176b9868e5646682f4a97cd8f8"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-x86_64-static_amd64.tgz"
+    sha256 = "28e6266c1bcab9f60dbbf4b2956bcb739eca0a77f05cfb6723f53d4e9f49a13a"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-x86_64_amd64.tgz"
 [[qemu-x86_64]]
 arch = "aarch64"
-git-tree-sha1 = "a2d47598ec825bb8964113a77bbca138324e37c1"
+git-tree-sha1 = "4f98f127fc88d3da768da2df4a3b2564fc7d5db7"
 lazy = true
 os = "linux"
 
     [[qemu-x86_64.download]]
-    sha256 = "1e75f4f8f84306bbe944c98bbd26e25134d34cfa940308e2f9871ad8bc8d76ca"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-x86_64-static_arm64v8.tgz"
+    sha256 = "4b780aec61b7b8ddfdd69127d14d9f6ccdbd2cf0b6fff94143f5d1f8dc0d9f57"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-x86_64_arm64v8.tgz"
 [[qemu-x86_64]]
 arch = "armv7l"
 call_abi = "eabihf"
@@ -236,10 +236,10 @@ os = "linux"
     url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-x86_64-static_arm32v7.tgz"
 [[qemu-x86_64]]
 arch = "powerpc64le"
-git-tree-sha1 = "f6a6ab80ffdb0970059a1bd0edb04ba2eab7a9f7"
+git-tree-sha1 = "2af6623e97546aa6e3bd345617282f46696d5187"
 lazy = true
 os = "linux"
 
     [[qemu-x86_64.download]]
-    sha256 = "7700bff013489b748ed27fbd2042c5bc5224d681eb446b359b91cf7618ec8039"
-    url = "https://github.com/dbhi/qus/releases/download/v0.0.11-v7.1%2Bdfsg-2--bpo11%2B3/qemu-x86_64-static_ppc64le.tgz"
+    sha256 = "baf96e9020a4cf9554154d05d197624a0ad28421577b6bb4477a450aa79266ca"
+    url = "https://github.com/dbhi/qus/releases/download/v0.0.12-v10.0.13%2Bds-0%2Bdeb13u1/qemu-x86_64_ppc64le.tgz"

@@ -9,9 +9,9 @@
 [docs-stable-url]: https://juliacontainerization.github.io/Sandbox.jl/stable
 [docs-dev-img]: https://img.shields.io/badge/docs-dev-blue.svg
 [docs-dev-url]: https://juliacontainerization.github.io/Sandbox.jl/dev
-[ci-img]: https://github.com/JuliaContainerization/Sandbox.jl/workflows/CI/badge.svg
+[ci-img]: https://github.com/JuliaContainerization/Sandbox.jl/actions/workflows/ci.yml/badge.svg?branch=main
 [ci-url]: https://github.com/JuliaContainerization/Sandbox.jl/actions/workflows/ci.yml
-[codecov-img]: https://codecov.io/gh/JuliaContainerization/Sandbox.jl/branch/master/graph/badge.svg
+[codecov-img]: https://codecov.io/gh/JuliaContainerization/Sandbox.jl/branch/main/graph/badge.svg
 [codecov-url]: https://codecov.io/gh/JuliaContainerization/Sandbox.jl
 
 > The cultured host's toolkit for ill-mannered Linux guests.
@@ -44,6 +44,16 @@ end
 ```
 
 While this launches an interactive session due to hooking up `stdout`/`stdin`, one can easily capture output by setting `stdout` to an `IOBuffer`, or even a `PipeBuffer` to chain together multiple processes from different sandboxes.
+
+## Ubuntu and AppArmor
+
+Since 23.10, Ubuntu uses AppArmor to prevent unprivileged processes from creating user namespaces, which the User Namespaces executor depends on.
+Sandbox.jl reports this when it detects it; to lift the restriction, run the following (it uses `sudo`, and persists the setting in `/etc/sysctl.d`):
+
+```julia
+using Sandbox
+Sandbox.disable_apparmor_userns_restrictions()
+```
 
 ## Getting more rootfs images
 

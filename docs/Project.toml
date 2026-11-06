@@ -1,5 +1,9 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Sandbox = "9307e30f-c43e-9ca7-d17c-c2dc59df670d"
+
+[sources]
+Sandbox = {path = ".."}
 
 [compat]
-Documenter = "~0.26"
+Documenter = "1"

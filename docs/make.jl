@@ -1,11 +1,12 @@
 using Documenter, Sandbox
 
-makedocs(
+makedocs(;
     modules = [Sandbox],
     sitename = "Sandbox.jl",
+    checkdocs = :exports,
 )
 
-deploydocs(
+deploydocs(;
     repo = "github.com/JuliaContainerization/Sandbox.jl.git",
     push_preview = true,
     devbranch = "main",
