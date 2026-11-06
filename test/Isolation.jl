@@ -200,6 +200,28 @@ for executor in userns_executors
             @test issubset(["nodev", "nosuid"], split(split(out)[4], ','))
         end
 
+        # Only for callers that do not have root's identity themselves
+        if PrivilegedUserNamespacesExecutor in userns_executors &&
+           Sandbox.getuid() != 0 && Sandbox.getgid() != 0
+            @testset "no supplementary groups of root" begin
+                # A host file that only root and its group can read
+                mktempdir() do dir
+                    secret = joinpath(dir, "secret")
+                    write(secret, "secret")
+                    run(`sudo -n chown root:root $(secret)`)
+                    run(`sudo -n chmod 640 $(secret)`)
+                    try
+                        ok, out, err = sandbox_sh(executor, "cat /m/secret";
+                            mounts=Dict("/m" => MountInfo(dir, MountType.ReadOnly)))
+                        @test !ok
+                        @test occursin("Permission denied", err)
+                    finally
+                        run(`sudo -n rm $(secret)`)
+                    end
+                end
+            end
+        end
+
         @testset "private IPC namespace and /dev/shm" begin
             # A marker in the host's /dev/shm must not be visible inside
             marker = "sandbox-isolation-test-$(getpid())"

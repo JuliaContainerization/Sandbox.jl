@@ -36,6 +36,7 @@ Then run it, mounting in a rootfs with a workspace and no other read-only maps:
 */
 
 #include "userns_common.h"
+#include <grp.h>
 
 // sandbox_root is the location of the rootfs on disk.  This is required.
 char *sandbox_root = NULL;
@@ -375,6 +376,30 @@ static void die_with_launcher(int status_fd) {
   if (pfd.revents & POLLERR) {
     _exit(EXIT_SANDBOX_FAILED);
   }
+}
+
+/*
+ * In privileged mode, the sandbox runs as the calling user, but we were started with
+ * the supplementary groups of root (as sudo sets them), which would keep giving it
+ * root's group access to host files.  Drop them all: the calling user's own
+ * supplementary groups are not known here (sudo does not pass them on), and looking
+ * them up would need NSS, which a static binary cannot use.  The primary group
+ * remains, mapped from SUDO_GID.
+ *
+ * Within a user namespace that denies setgroups(), as in another sandbox, whoever set
+ * that up already decided the groups, and we keep them.
+ */
+static void drop_supplementary_groups() {
+  if (setgroups(0, NULL) == 0) {
+    return;
+  }
+  check(errno == EPERM);
+  char setgroups_state[8] = {0};
+  int fd = open("/proc/self/setgroups", O_RDONLY | O_CLOEXEC);
+  check(fd != -1);
+  check(read(fd, setgroups_state, sizeof(setgroups_state) - 1) > 0);
+  close(fd);
+  check(strncmp(setgroups_state, "deny", 4) == 0);
 }
 
 /*
@@ -762,6 +787,8 @@ int main(int sandbox_argc, char **sandbox_argv) {
     // Mount the rootfs, shards, and workspace.  We do this here because, on this machine,
     // we may not have permissions to mount overlayfs within user namespaces.
     mount_the_world(sandbox_root, mounts, uid, gid, persist_dir, tmpfs_size);
+
+    drop_supplementary_groups();
   }
 
   // We want to request a new PID space, a new mount space, a new user space, and
