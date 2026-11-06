@@ -131,6 +131,14 @@ end
 
         # Verify the regular file got chmod'd
         @test filemode(joinpath(tasks_dir, "regular.txt")) & 0o777 == 0o777
+
+        # Symlinks are not followed out of the tree
+        victim = joinpath(dir, "victim")
+        touch(victim)
+        chmod(victim, 0o600)
+        symlink(victim, joinpath(tasks_dir, "link"))
+        Sandbox.chmod_recursive(joinpath(dir, "upper"), 0o777, false)
+        @test filemode(victim) & 0o777 == 0o600
     end
 end
 

@@ -17,6 +17,9 @@ function chmod_recursive(root::String, perms, use_sudo::Bool)
     end
     for f in files
         path = joinpath(root, f)
+        # The tree was written by the sandbox, and `chmod` would follow a symlink to
+        # wherever it points on the host.
+        islink(path) && continue
         try
             if use_sudo
                 run(`$(sudo_cmd()) chmod $(string(perms, base=8)) $(path)`)
@@ -28,7 +31,7 @@ function chmod_recursive(root::String, perms, use_sudo::Bool)
                 rethrow(e)
             end
         end
-        if !islink(path) && isdir(path)
+        if isdir(path)
             chmod_recursive(path, perms, use_sudo)
         end
     end
