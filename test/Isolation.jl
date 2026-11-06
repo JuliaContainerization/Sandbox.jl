@@ -1,11 +1,9 @@
 using Test, Sandbox
 
-# These tests cover behaviour of the sandbox binary that the released UserNSSandbox_jll
-# does not have yet, so they only run against a binary built from this checkout.  Where
-# an executor can run, a sandbox that fails to start must fail the tests rather than
-# drop the executor from them, so only the host's support is checked up front.
+# Where an executor can run, a sandbox that fails to start must fail the tests rather
+# than drop the executor from them, so only the host's support is checked up front.
 userns_executors = Type{<:UserNamespacesExecutor}[]
-if should_build_local_sandbox && UserNSSandbox_jll.is_available() &&
+if UserNSSandbox_jll.is_available() &&
    Sandbox.check_kernel_version() && Sandbox.check_overlayfs_loaded()
     if Sandbox.getuid() != 0
         push!(userns_executors, UnprivilegedUserNamespacesExecutor)
