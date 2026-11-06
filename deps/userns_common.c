@@ -28,16 +28,6 @@ int open_proc_file(pid_t pid, const char *file, int mode) {
   return fd;
 }
 
-/* `touch` a file; create it if it doesn't already exist. */
-void touch(const char * path) {
-  int fd = open(path, O_RDONLY | O_CREAT, S_IRUSR | S_IRGRP | S_IROTH);
-  // Ignore EISDIR as sometimes we try to `touch()` a directory
-  if (fd == -1 && errno != EISDIR) {
-    check(fd != -1);
-  }
-  close(fd);
-}
-
 /* Make all directories up to the given directory name. */
 void mkpath(const char * dir) {
   // If this directory already exists, back out.
@@ -68,15 +58,6 @@ int isdir(const char * path) {
   return S_ISDIR(path_stat.st_mode);
 }
 
-int islink(const char * path) {
-  struct stat path_stat;
-  int result = stat(path, &path_stat);
-
-  // Silently ignore calling `islink()` on a non-existant path
-  check((0 == result) || (errno == ENOENT) || (errno == ENOTDIR));
-  return S_ISLNK(path_stat.st_mode);
-}
-
 int unlink_callback(const char *fpath, const struct stat * a, int b, struct FTW * c) {
   int rv = remove(fpath);
   if (rv) {
@@ -105,6 +86,183 @@ uint32_t string_hash(const char *str, uint32_t h) {
 void hashed_basename(char *output, const char *path) {
   uint32_t hash = string_hash(path, 0x5f3759df);
   sprintf(output, "%s-%x", basename((char *)path), hash);
+}
+
+
+/**** Paths inside the sandbox *****
+ *
+ * Mount destinations are looked up in the rootfs before we enter it.  The rootfs, and
+ * the upper layer persisted from earlier runs, are under the control of the image and
+ * of whatever ran in the sandbox before, so they may contain symlinks pointing anywhere.
+ * Resolved by plain path from outside, an absolute symlink would lead the launcher to
+ * create mount points on the host (as root, in privileged mode) and to mount over host
+ * paths.  So destinations are resolved by descriptor, as if the rootfs were `/`, and
+ * mount(2) is handed the resulting descriptor through /proc/self/fd.
+ */
+
+void fd_path(char *buf, int fd) {
+  int n = snprintf(buf, FD_PATH_SIZE, "/proc/self/fd/%d", fd);
+  check(n > 0 && n < FD_PATH_SIZE);
+}
+
+int open_root(const char *root_dir) {
+  if (root_dir[0] == '\0') {
+    root_dir = "/";
+  }
+  int fd = open(root_dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+  check(fd != -1);
+  return fd;
+}
+
+#define MAX_RESOLVE_DEPTH 256
+#define MAX_RESOLVE_LINKS 40
+
+/*
+ * Opens `path` beneath the directory `root_fd` with O_PATH, resolving it as if `root_fd`
+ * were the root directory: absolute symlinks start over from `root_fd`, and ".." does not
+ * go above it.  If `create` is S_IFDIR or S_IFREG, missing components are created, as
+ * directories except for the last one, which gets the type `create`.  Following a
+ * dangling symlink creates its target, so that a destination like Ubuntu's
+ * /etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf can be mapped over.
+ * Returns -1 with `errno` set on failure.
+ *
+ * openat2(RESOLVE_IN_ROOT) could resolve an existing path in one call, but it needs
+ * Linux 5.6, and creating what is missing takes a walk like this one anyway.  Each step
+ * is an openat(O_NOFOLLOW) relative to the directory before it, and symlinks are read and
+ * resolved here, so the kernel never follows one (or a /proc magic link) for us.  ".."
+ * goes back to the directory we came from, which is what RESOLVE_IN_ROOT does as well.
+ */
+int open_in_root(int root_fd, const char *path, mode_t create) {
+  char buf[PATH_MAX], next[PATH_MAX], target[PATH_MAX];
+  // The directories walked so far; the last one is where we are.
+  int dirs[MAX_RESOLVE_DEPTH];
+  int depth = 0, links = 0, fd = -1, saved_errno;
+  struct stat st;
+
+  if (strlen(path) >= sizeof(buf)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  strcpy(buf, path);
+  char *rest = buf;
+  for (;;) {
+    while (*rest == '/') {
+      rest++;
+    }
+    if (*rest == '\0') {
+      break;
+    }
+    char *name = rest;
+    rest = strchrnul(rest, '/');
+    int slash = *rest == '/';
+    if (slash) {
+      *rest++ = '\0';
+    }
+    int last = rest[strspn(rest, "/")] == '\0';
+    // As in any lookup, a trailing slash requires a directory.
+    int dir_only = !last || slash;
+
+    if (strcmp(name, ".") == 0) {
+      continue;
+    }
+    if (strcmp(name, "..") == 0) {
+      if (depth > 0) {
+        close(dirs[--depth]);
+      }
+      continue;
+    }
+
+    int dir_fd = depth > 0 ? dirs[depth-1] : root_fd;
+    fd = openat(dir_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd == -1 && errno == ENOENT && create) {
+      if (!dir_only && create == S_IFREG) {
+        int new_fd = openat(dir_fd, name, O_RDONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                            S_IRUSR | S_IRGRP | S_IROTH);
+        if (new_fd == -1 && errno != EEXIST) {
+          goto fail;
+        }
+        if (new_fd != -1) {
+          close(new_fd);
+        }
+      } else if (mkdirat(dir_fd, name, 0777) != 0 && errno != EEXIST) {
+        goto fail;
+      }
+      fd = openat(dir_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (fd == -1 || fstat(fd, &st) != 0) {
+      goto fail;
+    }
+
+    if (S_ISLNK(st.st_mode)) {
+      ssize_t len = readlinkat(fd, "", target, sizeof(target) - 1);
+      if (len == -1) {
+        goto fail;
+      }
+      close(fd);
+      fd = -1;
+      if (++links > MAX_RESOLVE_LINKS) {
+        errno = ELOOP;
+        goto fail;
+      }
+      target[len] = '\0';
+      int n = snprintf(next, sizeof(next), "%s%s%s", target, slash ? "/" : "", rest);
+      if (n < 0 || n >= sizeof(next)) {
+        errno = ENAMETOOLONG;
+        goto fail;
+      }
+      if (target[0] == '/') {
+        while (depth > 0) {
+          close(dirs[--depth]);
+        }
+      }
+      strcpy(buf, next);
+      rest = buf;
+      continue;
+    }
+
+    if (dir_only && !S_ISDIR(st.st_mode)) {
+      errno = ENOTDIR;
+      goto fail;
+    }
+    if (depth == MAX_RESOLVE_DEPTH) {
+      errno = ENAMETOOLONG;
+      goto fail;
+    }
+    dirs[depth++] = fd;
+    fd = -1;
+  }
+
+  if (depth > 0) {
+    fd = dirs[--depth];
+  } else {
+    fd = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+  }
+  while (depth > 0) {
+    close(dirs[--depth]);
+  }
+  return fd;
+
+fail:
+  saved_errno = errno;
+  if (fd != -1) {
+    close(fd);
+  }
+  while (depth > 0) {
+    close(dirs[--depth]);
+  }
+  errno = saved_errno;
+  return -1;
+}
+
+/* Like `open_in_root()`, but reports what went wrong and exits on failure. */
+int open_in_root_or_die(int root_fd, const char *path, mode_t create) {
+  int fd = open_in_root(root_fd, path, create);
+  if (fd == -1) {
+    fprintf(stderr, "ERROR: Failed to %s '%s' in the sandbox: %s (errno %d)\n",
+            create ? "create" : "open", path, strerror(errno), errno);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+  return fd;
 }
 
 
@@ -255,70 +413,67 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
 }
 
 void mount_procfs(const char * root_dir, uid_t uid, gid_t gid) {
-  char path[PATH_MAX];
+  char path[FD_PATH_SIZE];
 
-  // Mount procfs at <root_dir>/proc
-  snprintf(path, sizeof(path), "%s/proc", root_dir);
+  int root_fd = open_root(root_dir);
+  int fd = open_in_root_or_die(root_fd, "/proc", 0);
+  fd_path(path, fd);
   if (verbose) {
-    fprintf(stderr, "--> Mounting procfs at %s\n", path);
+    fprintf(stderr, "--> Mounting procfs at %s/proc\n", root_dir);
   }
-  // Attempt to unmount a previous /proc if it exists
   check(0 == mount("proc", path, "proc", 0, ""));
+  close(fd);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
   // owned by "nobody" when we're inside the sandbox.  We allow this to fail, as
   // sometimes we're trying to chown() something we don't own.
-  int ignored = chown(path, uid, gid);
+  fd = open_in_root_or_die(root_fd, "/proc", 0);
+  int ignored = fchownat(fd, "", uid, gid, AT_EMPTY_PATH);
+  close(fd);
+  close(root_fd);
 }
 
-void bind_mount(const char *src, const char *dest, char read_only) {
-  // If `src` is a symlink, this bindmount may run into issues, so we collapse
-  // `src` via `realpath()` to ensure that we get a non-symlink.
-  char resolved_src[PATH_MAX] = {0};
-  if (islink(src)) {
-    if (NULL == realpath(src, resolved_src)) {
-      if (verbose) {
-        fprintf(stderr, "WARNING: Unable to resolve %s ([%d] %s)\n", src, errno, strerror(errno));
-      }
-    }
-  }
-
-  if (resolved_src[0] == '\0') {
-    strncpy(resolved_src, src, PATH_MAX);
-  }
+/*
+ * Bind-mounts the host path `src` (or a /proc/self/fd path) at `dest` in the rootfs
+ * `root_fd`, creating the mount point as a directory or file to match `src`.
+ */
+void bind_mount(int root_fd, const char *src, const char *dest, char read_only) {
+  char src_path[FD_PATH_SIZE], dest_path[FD_PATH_SIZE];
 
   if (verbose) {
-    if (read_only) {
-      fprintf(stderr, "--> Bind-mounting %s over %s (read-only)\n", resolved_src, dest);
-    } else {
-      fprintf(stderr, "--> Bind-mounting %s over %s (read-write)\n", resolved_src, dest);
-    }
+    fprintf(stderr, "--> Bind-mounting %s over %s (%s)\n", src, dest,
+            read_only ? "read-only" : "read-write");
   }
 
-  // If we're mounting in a directory, create the mountpoint as a directory,
-  // otherwise as a file.  Note that if `src` does not exist, we'll create a
-  // file here, then error out on the `mount()` call.
-  if (isdir(resolved_src)) {
-    mkpath(dest);
-  } else {
-    char dest_dirname[PATH_MAX];
-    strncpy(dest_dirname, dest, PATH_MAX);
-    mkpath(dirname(&dest_dirname[0]));
-    touch(dest);
+  int src_fd = open(src, O_PATH | O_CLOEXEC);
+  if (src_fd == -1) {
+    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': %s (errno %d)\n",
+            src, dest, strerror(errno), errno);
+    fprintf(stderr, "  Please ensure that '%s' exists and is accessible.\n", src);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+  struct stat src_stat;
+  check(0 == fstat(src_fd, &src_stat));
+  fd_path(src_path, src_fd);
+
+  int dest_fd = open_in_root_or_die(root_fd, dest, S_ISDIR(src_stat.st_mode) ? S_IFDIR : S_IFREG);
+  fd_path(dest_path, dest_fd);
+
+  // A destination such as `/a/..`, or a symlink to `/`, would cover the root itself,
+  // which the rest of the setup (going through `root_fd`) would no longer see.
+  struct stat dest_stat, root_stat;
+  check(0 == fstat(dest_fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
+  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
+    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': it is the root of the sandbox\n", src, dest);
+    _exit(EXIT_SANDBOX_FAILED);
   }
 
   // We don't expect workspaces to have any submounts in normal operation.
   // However, for runshell(), workspace could be an arbitrary directory,
   // including one with sub-mounts, so allow that situation with MS_REC.
-  int mount_result = mount(resolved_src, dest, "", MS_BIND|MS_REC, NULL);
-  if (mount_result != 0 && errno == ENOENT) {
-    // Provide a more descriptive error for missing paths
-    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': %s (errno %d)\n",
-            resolved_src, dest, strerror(errno), errno);
-    fprintf(stderr, "  Please ensure that '%s' exists and is accessible.\n", resolved_src);
-    _exit(EXIT_SANDBOX_FAILED);
-  }
-  check(mount_result == 0);
+  check(0 == mount(src_path, dest_path, "", MS_BIND|MS_REC, NULL));
+  close(dest_fd);
+  close(src_fd);
 
   // remount to read-only. this requires a separate remount:
   // https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git/commit/?id=9ac77b8a78452eab0612523d27fee52159f5016a
@@ -327,9 +482,6 @@ void bind_mount(const char *src, const char *dest, char read_only) {
   if (read_only) {
     // we cannot apply locked mount flags blindly, because they change behaviour of the
     // mount (e.g. noexec), so figure out which ones we need by looking at mtab.
-    struct stat src_stat;
-    stat(resolved_src, &src_stat);
-
     struct mntent *mnt = NULL;
     FILE * mtab = setmntent("/proc/self/mounts", "r");
     check(mtab != NULL);
@@ -369,14 +521,17 @@ void bind_mount(const char *src, const char *dest, char read_only) {
             locked_flags |= MS_RELATIME;
         mnt_opt = strtok(NULL, ",");
     }
-    check(0 == mount(resolved_src, dest, "", MS_BIND|MS_REMOUNT|MS_RDONLY|locked_flags, NULL));
+
+    // The new mount is on top of the mount point, so look it up again.
+    dest_fd = open_in_root_or_die(root_fd, dest, 0);
+    fd_path(dest_path, dest_fd);
+    check(0 == mount(NULL, dest_path, "", MS_BIND|MS_REMOUNT|MS_RDONLY|locked_flags, NULL));
+    close(dest_fd);
   }
 }
 
-void bind_host_node(const char *root_dir, const char *name, char read_only) {
-  char path[PATH_MAX];
+void bind_host_node(int root_fd, const char *name, char read_only) {
   if (access(name, F_OK) == 0) {
-    snprintf(path, sizeof(path), "%s/%s", root_dir, name);
-    bind_mount(name, path, read_only);
+    bind_mount(root_fd, name, name, read_only);
   }
 }

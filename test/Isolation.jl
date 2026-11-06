@@ -85,6 +85,38 @@ for executor in userns_executors
             end
         end
 
+        @testset "map destinations are resolved in the rootfs" begin
+            mktempdir() do dir
+                write(joinpath(dir, "note.txt"), "great success")
+                note = MountInfo(joinpath(dir, "note.txt"), MountType.ReadOnly)
+                host_target = joinpath(dir, "created_by_sandbox")
+                stdout, stderr = IOBuffer(), IOBuffer()
+                config(mounts...) = SandboxConfig(
+                    Dict("/" => MountInfo(Sandbox.debian_rootfs(), MountType.Overlayed), mounts...),
+                    Dict("PATH" => "/usr/bin:/bin");
+                    stdout, stderr, persist=true,
+                )
+                with_executor(executor) do exe
+                    # Symlinks left behind by an earlier run: one pointing at the host
+                    # path, a dangling relative one like Ubuntu's /etc/resolv.conf, and
+                    # one to the root
+                    @test success(exe, config(), `/bin/sh -c """
+                        ln -s $(host_target) /escape
+                        ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+                        ln -s / /root_alias
+                        """`)
+                    @test success(exe, config("/escape" => note, "/etc/resolv.conf" => note),
+                                  `/bin/sh -c "cat /escape; cat /etc/resolv.conf"`)
+                    # A map cannot replace the root, even with a working rootfs
+                    @test !success(exe, config("/root_alias" => MountInfo(Sandbox.debian_rootfs(), MountType.ReadOnly)),
+                                   `/bin/true`)
+                end
+                @test String(take!(stdout)) == "great success"^2
+                @test occursin("it is the root of the sandbox", String(take!(stderr)))
+                @test !ispath(host_target)
+            end
+        end
+
         @testset "private IPC namespace and /dev/shm" begin
             # A marker in the host's /dev/shm must not be visible inside
             marker = "sandbox-isolation-test-$(getpid())"

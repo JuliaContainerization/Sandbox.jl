@@ -67,17 +67,22 @@ extern pid_t child_pid;
 void _check(int ok, const char * file, int line);
 #define check(ok) _check(ok, __FILE__, __LINE__)
 int open_proc_file(pid_t pid, const char *file, int mode);
-void touch(const char * path);
 void mkpath(const char * dir);
 int isdir(const char * path);
-int islink(const char * path);
 void rmrf(const char * path);
 void hashed_basename(char *output, const char *path);
+
+/* Paths inside the sandbox */
+#define FD_PATH_SIZE 32
+void fd_path(char *buf, int fd);
+int open_root(const char *root_dir);
+int open_in_root(int root_fd, const char *path, mode_t create);
+int open_in_root_or_die(int root_fd, const char *path, mode_t create);
 void setup_signal_forwarding();
 
 /* User namespaces */
 void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid, uid_t dst_uid, gid_t dst_gid);
 uint8_t mount_overlay(const char * src, const char * dest, const char * bname, const char * work_dir, uint8_t userxattr);
 void mount_procfs(const char * root_dir, uid_t uid, gid_t gid);
-void bind_mount(const char *src, const char *dest, char read_only);
-void bind_host_node(const char *root_dir, const char *name, char read_only);
+void bind_mount(int root_fd, const char *src, const char *dest, char read_only);
+void bind_host_node(int root_fd, const char *name, char read_only);

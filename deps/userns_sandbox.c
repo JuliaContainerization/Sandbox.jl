@@ -80,35 +80,36 @@ static int userxattr = 0;
  * /dev/{tty,null,urandom,pts,ptmx} into our root_dir.  /dev/shm is not the host's:
  * `mount_private()` mounts a fresh one from within the sandbox's IPC namespace.
  */
-static void mount_dev(const char * root_dir) {
-  char path[PATH_MAX];
+static void mount_dev(int root_fd) {
+  char path[FD_PATH_SIZE];
+  int fd;
 
   // These are all things that should exist in the host environment, but may not
   // We use `bind_host_node()` to bindmount them into our sandbox if they exist.
-  bind_host_node(root_dir, "/dev/null", FALSE);
-  bind_host_node(root_dir, "/dev/tty", FALSE);
-  bind_host_node(root_dir, "/dev/zero", FALSE);
-  bind_host_node(root_dir, "/dev/random", FALSE);
-  bind_host_node(root_dir, "/dev/urandom", FALSE);
+  bind_host_node(root_fd, "/dev/null", FALSE);
+  bind_host_node(root_fd, "/dev/tty", FALSE);
+  bind_host_node(root_fd, "/dev/zero", FALSE);
+  bind_host_node(root_fd, "/dev/random", FALSE);
+  bind_host_node(root_fd, "/dev/urandom", FALSE);
 
   // Create the mount point for `mount_private()`, which runs in the cloned child.
-  snprintf(path, sizeof(path), "%s/dev/shm", root_dir);
-  mkpath(path);
+  close(open_in_root_or_die(root_fd, "/dev/shm", S_IFDIR));
 
   // Bindmount the sysfs, but make it read-only
-  bind_host_node(root_dir, "/sys", TRUE);
+  bind_host_node(root_fd, "/sys", TRUE);
 
   // /dev/pts and /dev/ptmx are more special; we actually mount a new filesystem
   // on /dev/pts, and then bind-mount /dev/pts/ptmx to /dev/ptmx within the
   // sandbox itself.
-  snprintf(path, sizeof(path), "%s/dev/pts", root_dir);
-  mkpath(path);
+  fd = open_in_root_or_die(root_fd, "/dev/pts", S_IFDIR);
+  fd_path(path, fd);
   check(0 == mount("devpts", path, "devpts", 0, "ptmxmode=0666"));
+  close(fd);
 
-  snprintf(path, sizeof(path), "%s/dev/pts/ptmx", root_dir);
-  char ptmx_dst[PATH_MAX];
-  snprintf(ptmx_dst, sizeof(ptmx_dst), "%s/dev/ptmx", root_dir);
-  bind_mount(path, ptmx_dst, FALSE);
+  fd = open_in_root_or_die(root_fd, "/dev/pts/ptmx", 0);
+  fd_path(path, fd);
+  bind_mount(root_fd, path, "/dev/ptmx", FALSE);
+  close(fd);
 }
 
 /*
@@ -161,41 +162,42 @@ static void mount_the_world(const char * root_dir,
   // we're mounting before cloning, in unprivileged mode, we clone before calling
   // this mehod at all.
   check(TRUE == mount_overlay(root_dir, root_dir, "rootfs", persist_dir, userxattr));
+  int root_fd = open_root(root_dir);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
   // owned by "nobody" when we're inside the sandbox.
-  check(0 == chown(root_dir, uid, gid));
+  check(0 == fchownat(root_fd, "", uid, gid, AT_EMPTY_PATH));
 
   // Mount all of our mounts
   struct mount_list *entry = maps;
   while (entry != NULL) {
-    char path[PATH_MAX];
-    char *inside = entry->mount_point;
-
-    // Construct `${root_dir}/${mount_point}`:
-    while (inside[0] == '/') {
-      inside = inside + 1;
-    }
-    snprintf(path, sizeof(path), "%s/%s", root_dir, inside);
-
-    // bind-mount the outside path to the computed inside path,
+    // bind-mount the outside path to the inside path,
     // setting the bind-mount to be read-only if requested.
-    bind_mount(entry->outside_path,
-               path,
+    bind_mount(root_fd,
+               entry->outside_path,
+               entry->mount_point,
                entry->type == MOUNT_TYPE_READONLY || entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY);
 
     // If we're dealing with an overlayed mount, create a unique
     // name to store the state of this mount within our `persist_dir`.
     if (entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
-      char bname[PATH_MAX];
+      char bname[PATH_MAX], path[FD_PATH_SIZE];
       hashed_basename(&bname[0], entry->mount_point);
+      int fd = open_in_root_or_die(root_fd, entry->mount_point, 0);
+      fd_path(path, fd);
       check(TRUE == mount_overlay(path, path, bname, persist_dir, userxattr));
-      check(0 == chown(path, uid, gid));
+      close(fd);
+
+      // Each mount is stacked on what the path led to before, so look it up again.
+      fd = open_in_root_or_die(root_fd, entry->mount_point, 0);
+      fd_path(path, fd);
+      check(0 == fchownat(fd, "", uid, gid, AT_EMPTY_PATH));
 
       // If this is a "read-only" overlay mount, remount as read-only here.
       if (entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
         check(0 == mount("overlay", path, "overlay", MS_REMOUNT|MS_RDONLY, ""));
       }
+      close(fd);
     }
     entry = entry->prev;
   }
@@ -204,7 +206,8 @@ static void mount_the_world(const char * root_dir,
   mount_procfs(root_dir, uid, gid);
 
   // Mount /dev stuff
-  mount_dev(root_dir);
+  mount_dev(root_fd);
+  close(root_fd);
 }
 
 /*
@@ -220,11 +223,13 @@ static void mount_the_world(const char * root_dir,
  *     to give, so the host's hierarchies are hidden behind an empty tmpfs instead.
  */
 static void mount_private(const char * root_dir, const char * shm_size) {
-  char path[PATH_MAX];
+  char path[FD_PATH_SIZE], cgroup_path[FD_PATH_SIZE];
   char options[64];
   int n;
 
-  snprintf(path, sizeof(path), "%s/dev/shm", root_dir);
+  int root_fd = open_root(root_dir);
+  int shm_fd = open_in_root_or_die(root_fd, "/dev/shm", 0);
+  fd_path(path, shm_fd);
   if (shm_size != NULL) {
     n = snprintf(options, sizeof(options), "mode=1777,size=%s", shm_size);
   } else {
@@ -232,42 +237,58 @@ static void mount_private(const char * root_dir, const char * shm_size) {
   }
   check(0 < n && n < sizeof(options));
   if (verbose) {
-    fprintf(stderr, "--> Mounting tmpfs at %s (%s)\n", path, options);
+    fprintf(stderr, "--> Mounting tmpfs at %s/dev/shm (%s)\n", root_dir, options);
   }
   check(0 == mount("tmpfs", path, "tmpfs", MS_NOSUID|MS_NODEV, options));
+  close(shm_fd);
 
   struct statfs cgroup_fs;
-  snprintf(path, sizeof(path), "%s/sys/fs/cgroup", root_dir);
-  if (statfs(path, &cgroup_fs) != 0) {
+  int cgroup_fd = open_in_root(root_fd, "/sys/fs/cgroup", 0);
+  if (cgroup_fd == -1 || fstatfs(cgroup_fd, &cgroup_fs) != 0) {
     // No /sys/fs/cgroup on the host, so nothing to cover.
+    if (cgroup_fd != -1) {
+      close(cgroup_fd);
+    }
+    close(root_fd);
     return;
   }
+  fd_path(cgroup_path, cgroup_fd);
   unsigned long cgroup_flags = MS_NOSUID|MS_NODEV|MS_NOEXEC;
   if (cgroup_fs.f_type == CGROUP2_SUPER_MAGIC) {
     if (verbose) {
-      fprintf(stderr, "--> Mounting cgroup2 at %s (read-only)\n", path);
+      fprintf(stderr, "--> Mounting cgroup2 at %s/sys/fs/cgroup (read-only)\n", root_dir);
     }
     // The new mount shares its superblock with the host's mount it covers, which
     // mount(2) refuses to stack directly (EBUSY), and the superblock is writable, so
     // it cannot be asked for read-only either.  Mount it in the scratch space of the
     // fresh /dev/shm, make that mount read-only, then move it into place.
-    char staging[PATH_MAX];
-    snprintf(staging, sizeof(staging), "%s/dev/shm/.cgroup", root_dir);
-    check(0 == mkdir(staging, 0700));
-    if (0 != mount("cgroup2", staging, "cgroup2", cgroup_flags, NULL)) {
+    shm_fd = open_in_root_or_die(root_fd, "/dev/shm", 0);
+    check(0 == mkdirat(shm_fd, ".cgroup", 0700));
+    int staging_fd = openat(shm_fd, ".cgroup", O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+    check(staging_fd != -1);
+    fd_path(path, staging_fd);
+    if (0 != mount("cgroup2", path, "cgroup2", cgroup_flags, NULL)) {
       fprintf(stderr, "ERROR: Failed to mount cgroup2: %s (errno %d)\n",
               strerror(errno), errno);
       _exit(EXIT_SANDBOX_FAILED);
     }
-    check(0 == mount(NULL, staging, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|cgroup_flags, NULL));
-    check(0 == mount(staging, path, NULL, MS_MOVE, NULL));
-    check(0 == rmdir(staging));
+    close(staging_fd);
+    staging_fd = openat(shm_fd, ".cgroup", O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+    check(staging_fd != -1);
+    fd_path(path, staging_fd);
+    check(0 == mount(NULL, path, NULL, MS_REMOUNT|MS_BIND|MS_RDONLY|cgroup_flags, NULL));
+    check(0 == mount(path, cgroup_path, NULL, MS_MOVE, NULL));
+    close(staging_fd);
+    check(0 == unlinkat(shm_fd, ".cgroup", AT_REMOVEDIR));
+    close(shm_fd);
   } else {
     if (verbose) {
-      fprintf(stderr, "--> No cgroup2 hierarchy at %s, hiding it behind an empty tmpfs\n", path);
+      fprintf(stderr, "--> No cgroup2 hierarchy at %s/sys/fs/cgroup, hiding it behind an empty tmpfs\n", root_dir);
     }
-    check(0 == mount("tmpfs", path, "tmpfs", MS_RDONLY|cgroup_flags, "size=4k,mode=0755"));
+    check(0 == mount("tmpfs", cgroup_path, "tmpfs", MS_RDONLY|cgroup_flags, "size=4k,mode=0755"));
   }
+  close(cgroup_fd);
+  close(root_fd);
 }
 
 /*
