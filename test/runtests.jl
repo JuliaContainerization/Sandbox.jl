@@ -1,6 +1,24 @@
-# If our test harness requests a local sandbox, make it so!
+# Which launcher to test: `SANDBOX_BUILD_LOCAL_SANDBOX=true` builds it from `deps/`, `false`
+# (the default) uses UserNSSandbox_jll's, and `auto` builds it only if `deps/` changed after
+# that JLL was built, as there is no JLL for such a change before it is merged.
 REPO_ROOT = dirname(@__DIR__)
-should_build_local_sandbox = parse(Bool, get(ENV, "SANDBOX_BUILD_LOCAL_SANDBOX", "false"))
+launcher_source = lowercase(get(ENV, "SANDBOX_BUILD_LOCAL_SANDBOX", "false"))
+should_build_local_sandbox = if launcher_source == "auto"
+    using Pkg
+    include(joinpath(REPO_ROOT, "deps", "build_ci.jl"))
+    jll_version = only(d.version for d in values(Pkg.dependencies()) if d.name == "UserNSSandbox_jll")
+    if launcher_changed_since(jll_version)
+        msg = "The launcher changed after UserNSSandbox_jll $(jll_version) was built, so it is built from source. Releasing needs a new JLL."
+        # a release must use the launcher its JLL ships
+        startswith(get(ENV, "GITHUB_REF", ""), "refs/tags/") && error(msg)
+        haskey(ENV, "GITHUB_ACTIONS") && println("::warning ::", msg)
+        true
+    else
+        false
+    end
+else
+    parse(Bool, launcher_source)
+end
 if should_build_local_sandbox
     @info("Building local sandbox")
     run(`$(Base.julia_cmd()) --project=$(Base.active_project()) $(REPO_ROOT)/deps/build_local_sandbox.jl`)
