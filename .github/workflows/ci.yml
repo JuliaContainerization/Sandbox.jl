@@ -27,17 +27,11 @@ jobs:
       matrix:
         version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
         os: ['ubuntu-24.04', 'ubuntu-24.04-arm']
-        # `local` builds the sandbox from deps/, which is what pull requests change;
-        # `jll` uses the released UserNSSandbox_jll binaries that users get
-        sandbox: ['local']
+        # `auto` tests the UserNSSandbox_jll launcher that users get, unless deps/ changed
+        # after it was built; `local` always builds the launcher from deps/
+        sandbox: ['auto']
         include:
-          - version: '1'
-            os: 'ubuntu-24.04'
-            sandbox: 'jll'
-          - version: '1'
-            os: 'ubuntu-24.04-arm'
-            sandbox: 'jll'
-          # sudo is sudo-rs here
+          # sudo is sudo-rs here, and the compiler is the newest
           - version: '1'
             os: 'ubuntu-26.04'
             sandbox: 'local'
@@ -47,13 +41,15 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # `auto` compares the launcher's history with the JLL's
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-runtest@v1
         env:
-          SANDBOX_BUILD_LOCAL_SANDBOX: ${{ matrix.sandbox == 'local' }}
+          SANDBOX_BUILD_LOCAL_SANDBOX: ${{ matrix.sandbox == 'local' && 'true' || 'auto' }}
           SANDBOX_TEST_REQUIRE_EXECUTORS: true
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v7
