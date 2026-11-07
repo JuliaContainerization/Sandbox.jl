@@ -154,17 +154,8 @@ if UserNSSandbox_jll.is_available()
         # Failures of the sandbox itself exit with 125, so that they can't be mistaken
         # for the command failing
         exe = UserNSSandbox_jll.sandbox_path
-        rootfs = Sandbox.debian_rootfs()
-        for args in [`--no-such-option --rootfs $(rootfs) /bin/true`,
-                     `--rootfs $(rootfs)`,
-                     `/bin/true`,
-                     `--rootfs $(rootfs) --mount relative:/mnt /bin/true`,
-                     `--rootfs $(rootfs) --mount /tmp:/mnt:bogus /bin/true`,
-                     `--rootfs $(rootfs) --mount /tmp /bin/true`,
-                     `--rootfs /does/not/exist /bin/true`]
-            p = run(pipeline(ignorestatus(`$(exe) $(args)`); stderr=devnull))
-            @test p.exitcode == 125
-        end
+        p = run(pipeline(ignorestatus(`$(exe) --protocol 3 --rootfs /does/not/exist -- /bin/true`); stderr=devnull))
+        @test p.exitcode == 125
     end
 end
 
@@ -281,10 +272,12 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
     @testset "optional flags in executor commands" begin
         exe = UnprivilegedUserNamespacesExecutor()
         config = SandboxConfig(Dict("/" => rootfs_dir); persist=false)
-        @test "--shm-size" ∉ Sandbox.build_executor_command(exe, config, `/bin/true`).exec
+        shm_options(config) = let args = Sandbox.build_executor_command(exe, config, `/bin/true`).exec
+            args[findfirst(i -> args[i] == "--tmpfs" && args[i+1] == "/dev/shm", eachindex(args)) + 2]
+        end
+        @test shm_options(config) == "mode=1777"
         config = SandboxConfig(Dict("/" => rootfs_dir); persist=false, shm_size="64M")
-        args = Sandbox.build_executor_command(exe, config, `/bin/true`).exec
-        @test args[findfirst(==("--shm-size"), args) + 1] == "64M"
+        @test shm_options(config) == "mode=1777,size=64M"
     end
 
     @testset "mount ordering in executor commands" begin
@@ -306,29 +299,10 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
             exe = UnprivilegedUserNamespacesExecutor()
             cmd = Sandbox.build_executor_command(exe, config, `/bin/true`)
 
-            # Extract the command arguments as strings
-            cmd_args = cmd.exec
-
-            # Find all --mount arguments
-            mount_args = String[]
-            for i in 1:length(cmd_args)-1
-                if cmd_args[i] == "--mount"
-                    push!(mount_args, cmd_args[i+1])
-                end
-            end
-
-            # Extract the sandbox paths from mount args (format: "host:sandbox:type")
-            mount_paths = String[]
-            for mount_arg in mount_args
-                parts = split(mount_arg, ":")
-                if length(parts) >= 2
-                    push!(mount_paths, parts[2])
-                end
-            end
-
-            # Verify that paths are ordered by length (longest first for UserNamespaces)
-            path_lengths = [length(path) for path in mount_paths]
-            @test issorted(path_lengths, rev=true)
+            # The launcher mounts in the order given, so parents come before their children
+            args = cmd.exec
+            dests = [args[i+2] for i in eachindex(args) if args[i] in ("--dev-bind", "--ro-dev-bind") && startswith(args[i+2], r"/usr|/etc")]
+            @test dests == ["/etc", "/etc/config", "/usr", "/usr/lib", "/usr/lib/test"]
         end
     end
 else

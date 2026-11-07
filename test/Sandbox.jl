@@ -102,7 +102,6 @@ for executor in all_executors
                 with_executor(executor) do exe
                     @test success(exe, config, user_cmd)
                     @test sort(split(String(take!(stdout)), '\n'; keepempty=false)) == [
-                        "FORCE_SANDBOX_MODE=unprivileged",  # set by the sandbox, for nesting
                         "LD_LIBRARY_PATH=science",
                         "PATH=/usr/bin:/bin",
                         "SHELL=friend",
@@ -303,6 +302,28 @@ for executor in all_executors
                     @test success(exe, config, `/bin/sh -c "echo aperture >> /read_only/science && cat /read_only/science"`)
                     @test String(take!(stdout)) == "entrypoint activated\naperture\n";
                     @test print_if_nonempty(take!(stderr))
+                end
+            end
+        end
+
+        # A read-only overlay of another directory at the same place shows what an earlier
+        # overlay there persisted (BinaryBuilder2 reads the results of a build this way).
+        # Docker doesn't support read-only overlays.
+        executor == DockerExecutor || @testset "read-only view of persisted changes" begin
+            mktempdir() do dir
+                mkdir(joinpath(dir, "lower"))
+                mkdir(joinpath(dir, "empty"))
+                write(joinpath(dir, "lower", "f"), "lower\n")
+                stdout = IOBuffer()
+                config(type, src) = SandboxConfig(
+                    Dict("/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                         "/o" => MountInfo(joinpath(dir, src), type));
+                    stdout, persist=true,
+                )
+                with_executor(executor) do exe
+                    @test success(exe, config(MountType.Overlayed, "lower"), `/bin/sh -c "echo changed > /o/f"`)
+                    @test success(exe, config(MountType.OverlayedReadOnly, "empty"), `/bin/cat /o/f`)
+                    @test String(take!(stdout)) == "changed\n"
                 end
             end
         end

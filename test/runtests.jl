@@ -83,6 +83,7 @@ if isdefined(Test, :detect_closure_boxes)
 end
 include("SandboxConfig.jl")
 include("UserNamespaces.jl")
+include("Launcher.jl")
 include("Docker.jl")
 include("Sandbox.jl")
 

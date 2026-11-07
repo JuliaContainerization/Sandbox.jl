@@ -125,6 +125,16 @@ for executor in userns_executors
             @test out == "found\n"
         end
 
+        @testset "no host processes below /proc" begin
+            # The procfs of the command's PID namespace is its own to unmount, which must
+            # not reveal a procfs of the host's
+            host_init = replace(read("/proc/1/cmdline", String), '\0' => ' ')
+            ok, out, err = sandbox_sh(executor, "umount /proc && tr '\\0' ' ' < /proc/1/cmdline")
+            @test ok
+            @test !isempty(out)
+            @test out != host_init
+        end
+
         @testset "no mount propagation from the host" begin
             # None of the sandbox's mounts is a peer or slave of a host mount
             ok, out, err = sandbox_sh(executor, "grep -cE ' (shared|master):' /proc/self/mountinfo")

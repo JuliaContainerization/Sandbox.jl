@@ -48,6 +48,9 @@
 #ifndef CGROUP2_SUPER_MAGIC
 #define CGROUP2_SUPER_MAGIC 0x63677270
 #endif
+#ifndef PROC_SUPER_MAGIC
+#define PROC_SUPER_MAGIC 0x9fa0
+#endif
 #ifndef O_PATH
 #define O_PATH 010000000
 #endif
@@ -81,7 +84,6 @@ int open_proc_file(pid_t pid, const char *file, int mode);
 void mkpath(const char * dir);
 int isdir(const char * path);
 void rmrf(const char * path);
-void hashed_basename(char *output, const char *path);
 
 /* Paths inside the sandbox */
 #define FD_PATH_SIZE 32
@@ -94,7 +96,7 @@ void setup_signal_forwarding();
 /* User namespaces */
 void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid, uid_t dst_uid, gid_t dst_gid);
 uint8_t mount_overlay(const char * src, const char * dest, const char * bname, const char * work_dir, uint8_t userxattr, unsigned long flags);
-void mount_procfs(const char * root_dir, uid_t uid, gid_t gid);
-void make_readonly(int fd, const char *dest);
-void bind_mount(int root_fd, const char *src, const char *dest, char read_only);
-void bind_host_node(int root_fd, const char *name, char read_only);
+void restrict_mount(int fd, const char *dest, unsigned long flags);
+void check_not_root(int root_fd, int fd, const char *dest);
+void check_not_proc(int fd, const char *dest);
+void bind_mount(int root_fd, int src_fd, const char *src, const char *dest, unsigned long flags);

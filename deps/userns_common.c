@@ -29,10 +29,11 @@ pid_t raw_fork(void) {
   return syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
 }
 
-/* Opens /proc/%pid/%file */
+/* Opens /proc/%pid/%file, or /proc/self/%file for a `pid` of 0 */
 int open_proc_file(pid_t pid, const char *file, int mode) {
   char path[PATH_MAX];
-  int n = snprintf(path, sizeof(path), "/proc/%d/%s", pid, file);
+  int n = pid == 0 ? snprintf(path, sizeof(path), "/proc/self/%s", file)
+                   : snprintf(path, sizeof(path), "/proc/%d/%s", pid, file);
   check(n >= 0 && n < sizeof(path));
   int fd = open(path, mode | O_CLOEXEC);
   check(fd != -1);
@@ -80,25 +81,6 @@ int unlink_callback(const char *fpath, const struct stat * a, int b, struct FTW 
 void rmrf(const char * path) {
   nftw(path, unlink_callback, 64, FTW_DEPTH | FTW_PHYS);
 }
-
-// One-byte-at-a-time hash based on Murmur's mix
-// Source: https://github.com/aappleby/smhasher/blob/master/src/Hashes.cpp
-// X-ref: https://stackoverflow.com/a/69812981/230778
-uint32_t string_hash(const char *str, uint32_t h) {
-    for (; *str; ++str) {
-        h ^= *str;
-        h *= 0x5bd1e995;
-        h ^= h >> 15;
-    }
-    return h;
-}
-
-// Given a path, return its basename plus a hash representing the rest of the path
-void hashed_basename(char *output, const char *path) {
-  uint32_t hash = string_hash(path, 0x5f3759df);
-  sprintf(output, "%s-%x", basename((char *)path), hash);
-}
-
 
 /**** Paths inside the sandbox *****
  *
@@ -382,7 +364,7 @@ void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid,
  */
 uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
                       const char * work_dir, uint8_t userxattr, unsigned long flags) {
-  char upper[PATH_MAX], work[PATH_MAX], opts[3*PATH_MAX+28];
+  char upper[PATH_MAX], work[PATH_MAX], opts[3*PATH_MAX+40];
 
   // Construct the location of our upper and work directories
   snprintf(upper, sizeof(upper), "%s/upper/%s", work_dir, bname);
@@ -411,25 +393,30 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   if (userxattr) {
     userxattr_opt = ",userxattr";
   }
-  snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s,workdir=%s%s", src, upper, work, userxattr_opt);
+  // Without the index, which the kernel may enable by default: with it, the upper layer
+  // only mounts again over the lower layer it was made with, while a read-only overlay
+  // of another directory is how the changes made through an overlay are looked at.
+  snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s,workdir=%s,index=off%s", src, upper, work, userxattr_opt);
   
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
   if (0 != mount("overlay", dest, "overlay", flags, opts)) {
+    int saved_errno = errno;
     if (verbose) {
       fprintf(stderr, "----> mount(\"overlay\", \"%s\", \"overlay\", %lu, \"%s\") failed: %d (%s)\n", dest, flags, opts, errno, strerror(errno));
     }
+    errno = saved_errno;
     return FALSE;
   }
 
   return TRUE;
 }
 
-/**** Read-only mounts *****
+/**** Restricted mounts *****
  *
- * A bind mount made read-only by MS_REMOUNT|MS_RDONLY is read-only on its own; the mounts
- * below it that came along with MS_REC stay writable.  mount_setattr(2) (Linux 5.12)
+ * A bind mount made read-only (or nodev, nosuid) by MS_REMOUNT is so on its own; the
+ * mounts below it that came along with MS_REC are not.  mount_setattr(2) (Linux 5.12)
  * changes a whole tree at once.  On older kernels, each mount of the tree is remounted
- * read-only by itself, as listed in /proc/self/mountinfo.
+ * by itself, as listed in /proc/self/mountinfo.
  */
 
 #ifndef SYS_mount_setattr
@@ -442,6 +429,8 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
 #define MS_NOSYMFOLLOW 256
 #endif
 #define SANDBOX_MOUNT_ATTR_RDONLY 0x00000001
+#define SANDBOX_MOUNT_ATTR_NOSUID 0x00000002
+#define SANDBOX_MOUNT_ATTR_NODEV 0x00000004
 
 struct sandbox_mount_attr {
   uint64_t attr_set;
@@ -516,10 +505,10 @@ struct mountinfo_entry {
 };
 
 /*
- * Remounts read-only, by themselves, the mount at `fd` and every mount below it in
- * /proc/self/mountinfo.  The submounts are looked up from `fd`, by their path below it.
+ * Remounts with `flags` added, by themselves, the mount at `fd` and every mount below it
+ * in /proc/self/mountinfo.  The submounts are looked up from `fd`, by their path below it.
  */
-static void make_readonly_fallback(int fd, const char *dest) {
+static void restrict_mount_fallback(int fd, const char *dest, unsigned long flags) {
   struct mountinfo_entry *entries = NULL;
   size_t n_entries = 0, cap = 0;
   char *line = NULL;
@@ -599,12 +588,12 @@ static void make_readonly_fallback(int fd, const char *dest) {
     }
     fd_path(path, sub_fd);
     if (verbose) {
-      fprintf(stderr, "----> Remounting %s read-only\n", e->mount_point);
+      fprintf(stderr, "----> Remounting %s\n", e->mount_point);
     }
-    // Only add MS_RDONLY: the kernel refuses to clear the flags it locked on mounts
-    // that came from a more privileged mount namespace.
-    if (0 != mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|e->flags, NULL)) {
-      fprintf(stderr, "ERROR: Failed to make %s read-only (%s): %s (errno %d)\n",
+    // Only add flags: the kernel refuses to clear the flags it locked on mounts that
+    // came from a more privileged mount namespace.
+    if (0 != mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|flags|e->flags, NULL)) {
+      fprintf(stderr, "ERROR: Failed to restrict %s (%s): %s (errno %d)\n",
               dest, e->mount_point, strerror(errno), errno);
       _exit(EXIT_SANDBOX_FAILED);
     }
@@ -617,98 +606,87 @@ static void make_readonly_fallback(int fd, const char *dest) {
 }
 
 /*
- * Makes the mount at `fd`, and all mounts below it, read-only.  `dest` names it in
- * messages.  SANDBOX_MOUNT_SETATTR=0 skips mount_setattr(2), so that the tests can
- * exercise the fallback for older kernels.
+ * Adds `flags` (MS_RDONLY, MS_NOSUID and MS_NODEV) to the mount at `fd` and all mounts
+ * below it.  `dest` names it in messages.  SANDBOX_MOUNT_SETATTR=0 skips
+ * mount_setattr(2), so that the tests can exercise the fallback for older kernels.
  */
-void make_readonly(int fd, const char *dest) {
+void restrict_mount(int fd, const char *dest, unsigned long flags) {
   const char *use_setattr = getenv("SANDBOX_MOUNT_SETATTR");
   if (use_setattr == NULL || strcmp(use_setattr, "0") != 0) {
-    struct sandbox_mount_attr attr = { .attr_set = SANDBOX_MOUNT_ATTR_RDONLY };
+    struct sandbox_mount_attr attr = {
+      .attr_set = (flags & MS_RDONLY ? SANDBOX_MOUNT_ATTR_RDONLY : 0) |
+                  (flags & MS_NOSUID ? SANDBOX_MOUNT_ATTR_NOSUID : 0) |
+                  (flags & MS_NODEV ? SANDBOX_MOUNT_ATTR_NODEV : 0),
+    };
     if (0 == syscall(SYS_mount_setattr, fd, "", AT_EMPTY_PATH | AT_RECURSIVE, &attr, sizeof(attr)))
       return;
     if (errno != ENOSYS) {
-      fprintf(stderr, "ERROR: Failed to make %s read-only: %s (errno %d)\n",
+      fprintf(stderr, "ERROR: Failed to restrict %s: %s (errno %d)\n",
               dest, strerror(errno), errno);
       _exit(EXIT_SANDBOX_FAILED);
     }
   }
-  make_readonly_fallback(fd, dest);
-}
-
-void mount_procfs(const char * root_dir, uid_t uid, gid_t gid) {
-  char path[FD_PATH_SIZE];
-
-  int root_fd = open_root(root_dir);
-  int fd = open_in_root_or_die(root_fd, "/proc", 0);
-  fd_path(path, fd);
-  if (verbose) {
-    fprintf(stderr, "--> Mounting procfs at %s/proc\n", root_dir);
-  }
-  check(0 == mount("proc", path, "proc", 0, ""));
-  close(fd);
-
-  // Chown this directory to the desired UID/GID, so that it doesn't look like it's
-  // owned by "nobody" when we're inside the sandbox.  We allow this to fail, as
-  // sometimes we're trying to chown() something we don't own.
-  fd = open_in_root_or_die(root_fd, "/proc", 0);
-  int ignored = fchownat(fd, "", uid, gid, AT_EMPTY_PATH);
-  close(fd);
-  close(root_fd);
+  restrict_mount_fallback(fd, dest, flags);
 }
 
 /*
- * Bind-mounts the host path `src` (or a /proc/self/fd path) at `dest` in the rootfs
- * `root_fd`, creating the mount point as a directory or file to match `src`.
+ * Refuses a destination such as `/a/..`, or a symlink to `/`, which would cover the root
+ * itself: the rest of the setup (going through `root_fd`) would no longer see it.
  */
-void bind_mount(int root_fd, const char *src, const char *dest, char read_only) {
+void check_not_root(int root_fd, int fd, const char *dest) {
+  struct stat dest_stat, root_stat;
+  check(0 == fstat(fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
+  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
+    fprintf(stderr, "ERROR: Failed to mount at '%s': it is the root of the sandbox\n", dest);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+}
+
+/*
+ * Refuses `fd` in the procfs, which the sandbox's init mounts again over the operations,
+ * as `add_op()` does for destinations that say /proc, for those that only get there
+ * through `..` or symlinks.
+ */
+void check_not_proc(int fd, const char *dest) {
+  struct statfs fs;
+  check(0 == fstatfs(fd, &fs));
+  if (fs.f_type == PROC_SUPER_MAGIC) {
+    fprintf(stderr, "ERROR: Failed to mount at '%s': it is in /proc, which the sandbox mounts itself\n", dest);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+}
+
+/*
+ * Bind-mounts `src_fd` (the host path `src`) at `dest` in the rootfs `root_fd`, creating
+ * the mount point as a directory or file to match it, and adds `flags` as for
+ * `restrict_mount()`.
+ */
+void bind_mount(int root_fd, int src_fd, const char *src, const char *dest, unsigned long flags) {
   char src_path[FD_PATH_SIZE], dest_path[FD_PATH_SIZE];
 
   if (verbose) {
-    fprintf(stderr, "--> Bind-mounting %s over %s (%s)\n", src, dest,
-            read_only ? "read-only" : "read-write");
+    fprintf(stderr, "--> Bind-mounting %s over %s (%s%s%s)\n", src, dest,
+            flags & MS_RDONLY ? "read-only" : "read-write",
+            flags & MS_NOSUID ? ", nosuid" : "", flags & MS_NODEV ? ", nodev" : "");
   }
 
-  int src_fd = open(src, O_PATH | O_CLOEXEC);
-  if (src_fd == -1) {
-    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': %s (errno %d)\n",
-            src, dest, strerror(errno), errno);
-    fprintf(stderr, "  Please ensure that '%s' exists and is accessible.\n", src);
-    _exit(EXIT_SANDBOX_FAILED);
-  }
   struct stat src_stat;
   check(0 == fstat(src_fd, &src_stat));
   fd_path(src_path, src_fd);
 
   int dest_fd = open_in_root_or_die(root_fd, dest, S_ISDIR(src_stat.st_mode) ? S_IFDIR : S_IFREG);
+  check_not_root(root_fd, dest_fd, dest);
+  check_not_proc(dest_fd, dest);
   fd_path(dest_path, dest_fd);
 
-  // A destination such as `/a/..`, or a symlink to `/`, would cover the root itself,
-  // which the rest of the setup (going through `root_fd`) would no longer see.
-  struct stat dest_stat, root_stat;
-  check(0 == fstat(dest_fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
-  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
-    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': it is the root of the sandbox\n", src, dest);
-    _exit(EXIT_SANDBOX_FAILED);
-  }
-
-  // We don't expect workspaces to have any submounts in normal operation.
-  // However, for runshell(), workspace could be an arbitrary directory,
-  // including one with sub-mounts, so allow that situation with MS_REC.
+  // Recursively, so that a bind of a tree with mounts below it shows them as well.
   check(0 == mount(src_path, dest_path, "", MS_BIND|MS_REC, NULL));
   close(dest_fd);
-  close(src_fd);
 
-  if (read_only) {
+  if (flags) {
     // The new mount is on top of the mount point, so look it up again.
     dest_fd = open_in_root_or_die(root_fd, dest, 0);
-    make_readonly(dest_fd, dest);
+    restrict_mount(dest_fd, dest, flags);
     close(dest_fd);
-  }
-}
-
-void bind_host_node(int root_fd, const char *name, char read_only) {
-  if (access(name, F_OK) == 0) {
-    bind_mount(root_fd, name, name, read_only);
   }
 }
