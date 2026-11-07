@@ -33,46 +33,56 @@ else
     end
 end
 
-# Remove `SANDBOX_FORCE_MODE`, as we want to test all modes
-if haskey(ENV, "FORCE_SANDBOX_MODE")
-    @warn("Un-setting `FORCE_SANDBOX_MODE` for tests...")
-    delete!(ENV, "FORCE_SANDBOX_MODE")
-end
-
 using Test, Sandbox, Scratch
 
-# If we're on a UserNSSandbox_jll-compatible system, ensure that the sandbox is coming from where we expect.
+# Ensure that the sandbox is coming from where we expect.
 UserNSSandbox_jll = Sandbox.UserNSSandbox_jll
-if UserNSSandbox_jll.is_available()
-    Artifacts = Sandbox.UserNSSandbox_jll.Artifacts
-    sandbox_path = Sandbox.UserNSSandbox_jll.sandbox_path
-    @info("On a UserNSSandbox_jll-capable platform", sandbox_path)
-    if should_build_local_sandbox
-        @test startswith(UserNSSandbox_jll.sandbox_path, Scratch.scratch_dir())
-    else
-        @test any(startswith(UserNSSandbox_jll.sandbox_path, d) for d in Artifacts.artifacts_dirs())
-    end
+@info("Testing with launcher", UserNSSandbox_jll.sandbox_path)
+if should_build_local_sandbox
+    @test startswith(UserNSSandbox_jll.sandbox_path, Scratch.scratch_dir())
+else
+    @test any(startswith(UserNSSandbox_jll.sandbox_path, d) for d in Sandbox.UserNSSandbox_jll.Artifacts.artifacts_dirs())
 end
 
-# Ensure we're not running as root; that breaks unprivileged user namespaces testing
+# The modes the host supports: unprivileged unless we are root (which hides what an
+# unprivileged sandbox can't do), and through sudo if it doesn't ask for a password.
 if Sandbox.getuid() == 0
     @warn("You are running Sandbox.jl tests as root!  This cannot test unprivileged namespaces!")
 end
-
-# The executor test sets skip executors that aren't available. Where all of them should
-# work (e.g. our CI), fail instead, so that a broken setup can't fall back unnoticed.
+candidate_modes = Symbol[]
+Sandbox.getuid() != 0 && push!(candidate_modes, :userns)
+Sys.which("sudo") !== nothing && success(`sudo -k -n true`) && push!(candidate_modes, :sudo)
+rootfs_dir = Sandbox.debian_rootfs()
+sandbox_works(mode) = success(pipeline(Sandbox.command(SandboxConfig(; rootfs=rootfs_dir, mode), `/bin/true`);
+                                       stdout=devnull, stderr=devnull))
+# Where all of them should work (e.g. our CI), fail instead of skipping one, so that a
+# broken setup can't go unnoticed.
 if parse(Bool, get(ENV, "SANDBOX_TEST_REQUIRE_EXECUTORS", "false"))
-    @testset "required executors" begin
-        @testset "$executor" for executor in Sandbox.all_executors
-            available = executor_available(executor)
-            if !available
-                # rerun verbosely to show why
-                executor_available(executor; verbose=true)
-            end
-            @test available
+    @testset "required modes" begin
+        @test !isempty(candidate_modes)
+        @testset "$(mode)" for mode in candidate_modes
+            @test sandbox_works(mode)
+            @test Sandbox.probe_persist(@get_scratch!("persist"); rootfs=rootfs_dir, mode, verbose=true)
         end
     end
+    modes = candidate_modes
+else
+    modes = filter(sandbox_works, candidate_modes)
 end
+isempty(modes) && @error("Skipping the tests that run sandboxes, as none can run here")
+
+# A new persist directory, and its removal.
+new_persist_dir() = Sandbox.scratch_persist_dir()
+remove_persist(dir, mode) = Sandbox.remove_persist(dir; mode)
+
+# Runs `cmd` in a sandbox of `config`, returning `(process, stdout, stderr)`.
+function sandbox_run(config::SandboxConfig, cmd::Cmd)
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(Sandbox.command(config, ignorestatus(cmd)); stdout=out, stderr=err))
+    return p, String(take!(out)), String(take!(err))
+end
+
+const default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 include("aqua.jl")
 # captured variables that get boxed (`Core.Box`) lose their type
@@ -81,15 +91,11 @@ if isdefined(Test, :detect_closure_boxes)
         @test Test.detect_closure_boxes(Sandbox) == []
     end
 end
+include("utils.jl")
 include("SandboxConfig.jl")
-include("UserNamespaces.jl")
 include("Launcher.jl")
-include("Docker.jl")
 include("Sandbox.jl")
-
-if Sys.islinux()
-    include("Isolation.jl")
-    include("Lifecycle.jl")
-    include("Nesting.jl")
-    include("Multiarch.jl")
-end
+include("Isolation.jl")
+include("Lifecycle.jl")
+include("Nesting.jl")
+include("Multiarch.jl")

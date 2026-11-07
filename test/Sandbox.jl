@@ -1,450 +1,203 @@
-using Test, Sandbox, SHA, Base.BinaryPlatforms
+using Test, Sandbox, SHA
+using Sandbox: command
 
-all_executors = Sandbox.all_executors
+for mode in modes
+    @testset "Sandboxing ($(mode))" begin
+        config(; kwargs...) = SandboxConfig(; rootfs=rootfs_dir, mode, env=Dict("PATH" => default_path), kwargs...)
 
-# Can we run `sudo` without a password?  If not, don't attempt to test the privileged runner
-if Sys.which("sudo") !== nothing && !success(`sudo -k -n true`)
-    all_executors = filter(exe -> exe != PrivilegedUserNamespacesExecutor, all_executors)
-end
-if Sandbox.getuid() == 0
-    all_executors = filter(exe -> exe != UnprivilegedUserNamespacesExecutor, all_executors)
-end
-
-function print_if_nonempty(stderr::Vector{UInt8})
-    if !isempty(stderr)
-        stderr = String(stderr)
-        @error("not empty")
-        println(stderr)
-        return false
-    end
-    return true
-end
-
-rootfs_dir = Sandbox.debian_rootfs()
-for executor in all_executors
-    if !executor_available(executor)
-        @error("Skipping $(executor) tests, as it does not seem to be available")
-        continue
-    end
-
-    @testset "$(executor) Sandboxing" begin
-        @testset "capturing stdout/stderr" begin
-            stdout = IOBuffer()
-            stderr = IOBuffer()
-            config = SandboxConfig(
-                Dict("/" => rootfs_dir);
-                stdout,
-                stderr,
-            )
-            with_executor(executor) do exe
-                @test success(exe, config, `/bin/sh -c "echo stdout; echo stderr >&2"`)
-                @test String(take!(stdout)) == "stdout\n"
-                @test String(take!(stderr)) == "stderr\n"
-            end
-
-            # Test that we can run using the same exe and config multiple times:
-            with_executor(executor) do exe
-                @test success(exe, config, `/bin/sh -c "echo first"`)
-                @test String(take!(stdout)) == "first\n"
-                @test success(exe, config, `/bin/sh -c "echo second"`)
-                @test String(take!(stdout)) == "second\n"
-            end
-        end
-
-        @testset "ignorestatus()" begin
-            config = SandboxConfig(Dict("/" => rootfs_dir))
-            with_executor(executor) do exe
-                @test_throws ProcessFailedException run(exe, config, `/bin/sh -c "false"`)
-                @test !success(exe, config, ignorestatus(`/bin/sh -c "false"`))
-            end
-        end
-
-        @testset "environment passing" begin
-            # Ensure all those pesky "special" variables make it through
-            env = Dict(
-                "PATH" => "for",
-                "LD_LIBRARY_PATH" => "science",
-                "DYLD_LIBRARY_PATH" => "you",
-                "SHELL" => "monster",
-            )
-            stdout = IOBuffer()
-            config = SandboxConfig(
-                Dict("/" => rootfs_dir),
-                Dict{String,String}(),
-                env;
-                stdout,
-            )
-            user_cmd = `/bin/sh -c "echo \$PATH \$LD_LIBRARY_PATH \$DYLD_LIBRARY_PATH \$SHELL"`
-            with_executor(executor) do exe
-                @test success(exe, config, user_cmd)
-                @test String(take!(stdout)) == "for science you monster\n";
-            end
-
-            # Test that setting some environment onto `user_cmd` can override the `config` env:
-            user_cmd = setenv(user_cmd, "DYLD_LIBRARY_PATH" => "my", "SHELL" => "friend")
-            with_executor(executor) do exe
-                @test success(exe, config, user_cmd)
-                @test String(take!(stdout)) == "for science my friend\n";
-            end
-
-            # The command should see exactly the requested environment, with nothing added by
-            # `sudo` (`HOME`, `USER`, `SUDO_*`, ...) and nothing written to stderr.
-            if executor <: UserNamespacesExecutor
-                stdout = IOBuffer()
-                stderr = IOBuffer()
-                config = SandboxConfig(
-                    Dict("/" => rootfs_dir),
-                    Dict{String,String}(),
-                    Dict("PATH" => "/usr/bin:/bin", "LD_LIBRARY_PATH" => "science");
-                    stdout, stderr,
-                )
-                user_cmd = setenv(`/usr/bin/env`, "SHELL" => "friend")
-                with_executor(executor) do exe
-                    @test success(exe, config, user_cmd)
-                    @test sort(split(String(take!(stdout)), '\n'; keepempty=false)) == [
-                        "LD_LIBRARY_PATH=science",
-                        "PATH=/usr/bin:/bin",
-                        "SHELL=friend",
-                    ]
-                    @test print_if_nonempty(take!(stderr))
-                end
-            end
-        end
-
-        @testset "reading from mounts" begin
-            mktempdir() do dir
-                open(joinpath(dir, "note.txt"), write=true) do io
-                    write(io, "great success")
-                end
-                stdout = IOBuffer()
-                config = SandboxConfig(
-                    Dict("/" => rootfs_dir, "/glados" => dir);
-                    stdout,
-                )
-                with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "cat /glados/note.txt"`)
-                    @test String(take!(stdout)) == "great success";
-                end
-            end
-        end
-
-        @testset "writing to mounts" begin
-            mktempdir() do dir
-                config = SandboxConfig(
-                    Dict(
-                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
-                        "/glados" => MountInfo(dir, MountType.ReadWrite),
-                    );
-                )
-                with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "echo aperture > /glados/science.txt"`)
-                    @test isfile(joinpath(dir, "science.txt"))
-                    @test String(read(joinpath(dir, "science.txt"))) == "aperture\n"
-                end
-            end
-        end
-
-        @testset "OverlayedReadOnly" begin
-            mktempdir() do dir
-                config = SandboxConfig(
-                    Dict(
-                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
-                        "/read_only" => MountInfo(dir, MountType.OverlayedReadOnly),
-                    );
-                )
-                with_executor(executor) do exe
-                    # We don't support OverlayedReadOnly mounts on Docker right now
-                    @test success(exe, config, `/bin/sh -c "[ -d /read_only ]"`) broken=(executor == DockerExecutor)
-                    @test !success(exe, config, `/bin/sh -c "echo aperture > /read_only/error.txt 2>&1"`)
-                end
-            end
-        end
-
-        @testset "pipelining" begin
-            pipe = PipeBuffer()
-            stdout = IOBuffer()
-            first_config = SandboxConfig(
-                Dict("/" => rootfs_dir),
-                stdout = pipe,
-            )
-            second_config = SandboxConfig(
-                Dict("/" => rootfs_dir),
-                stdin = pipe,
-                stdout = stdout,
-            )
-            with_executor(executor) do exe
-                @test success(exe, first_config, `/bin/sh -c "echo 'ignore me'; echo 'pick this up foo'; echo 'ignore me as well'"`)
-                @test success(exe, second_config, `/bin/sh -c "grep foo"`)
-                @test String(take!(stdout)) == "pick this up foo\n";
-            end
-        end
-
-        @testset "redirected user command" begin
-            stdout = IOBuffer()
-            config = SandboxConfig(Dict("/" => rootfs_dir); stdout)
-            mktempdir() do dir
-                path = joinpath(dir, "stderr")
+        @testset "standard streams" begin
+            p, out, err = sandbox_run(config(), `/bin/sh -c "echo stdout; echo stderr >&2"`)
+            @test success(p)
+            @test (out, err) == ("stdout\n", "stderr\n")
+            @test read(pipeline(command(config(), `/bin/sh -c "read x; echo \$x\$x"`); stdin=IOBuffer("ab\n")),
+                       String) == "abab\n"
+            # Between two sandboxes
+            out = read(pipeline(command(config(), `/bin/sh -c "echo 'ignore me'; echo 'pick this up foo'"`),
+                                command(config(), `/bin/grep foo`)), String)
+            @test out == "pick this up foo\n"
+            # Other fds than the standard ones (which sudo closes)
+            if mode == :userns
                 buf = IOBuffer()
-                cmd = pipeline(`/bin/sh -c "echo out; echo err >&2"`; stdout=buf, stderr=path)
-                with_executor(executor) do exe
-                    @test success(exe, config, cmd)
-                end
-                @test String(take!(buf)) == "out\n"
-                @test read(path, String) == "err\n"
-                @test isempty(take!(stdout))
+                @test success(Base.CmdRedirect(command(config(), `/bin/sh -c "echo hello >&3"`), buf, 3))
+                @test String(take!(buf)) == "hello\n"
             end
         end
 
-        # While we don't strictly care about read-only mounts, we might in the future,
-        # so we ensure they're supported.  What we _truly_ care about is Overlayed,
-        # mounts, where the modifications are visible only inside the sandbox, and are
-        # saved within the persistence directory
-        @testset "ReadOnly, ReadWrite and Overlayed MountTypes" begin
+        @testset "exit status" begin
+            @test_throws ProcessFailedException run(config(), `/bin/false`)
+            @test !success(command(config(), `/bin/false`))
+            @test run(config(), ignorestatus(`/bin/false`)).exitcode == 1
+        end
+
+        @testset "environment" begin
+            env = Dict("PATH" => "/usr/bin:/bin", "LD_LIBRARY_PATH" => "science", "SHELL" => "monster")
+            # The command sees exactly the environment asked for, nothing added by the
+            # launcher or by sudo
+            p, out, err = sandbox_run(config(; env), setenv(`/usr/bin/env`, "SHELL" => "friend"))
+            @test success(p)
+            @test sort(split(out, '\n'; keepempty=false)) ==
+                  ["LD_LIBRARY_PATH=science", "PATH=/usr/bin:/bin", "SHELL=friend"]
+            @test isempty(err)
+        end
+
+        @testset "binds" begin
             mktempdir() do dir
-                stdout = IOBuffer()
-                stderr = IOBuffer()
-                mkpath(joinpath(dir, "read_only"))
-                mkpath(joinpath(dir, "read_write"))
-                mkpath(joinpath(dir, "overlayed"))
-                config = SandboxConfig(
-                    Dict(
-                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
-                        "/read_only" => MountInfo(joinpath(dir, "read_only"), MountType.ReadOnly),
-                        "/read_write" => MountInfo(joinpath(dir, "read_write"), MountType.ReadWrite),
-                        "/overlayed" => MountInfo(joinpath(dir, "overlayed"), MountType.Overlayed),
-                    );
-                    stdout,
-                    stderr,
-                    persist=false,
-                    #verbose=executor == DockerExecutor,
-                )
-                # Modifying the rootfs works, and is temporary; for docker containers this is modifying
-                # the rootfs image, for userns this is all mounted within an overlay backed by a tmpfs,
-                # because we have `persist` set to `false`.  Modifying `/read_only` does not work,
-                # Modifying `/read_write` works and is visible to the host, modifying `/overlayed` works
-                # but is not visible to the host.
-                with_executor(executor) do exe
-                    # Because `persist=false`, this is non-persistent.
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /bin/science && cat /bin/science"`)
-                    @test String(take!(stdout)) == "aperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /bin/science && cat /bin/science"`)
-                    @test String(take!(stdout)) == "aperture\n";
-                    @test print_if_nonempty(take!(stderr))
-
-                    # An actual read-only mount will not allow writing, because it's truly read-only
-                    @test !success(exe, config, ignorestatus(`/bin/sh -c "echo aperture >> /read_only/science && cat /read_only/science"`))
-                    @test occursin("Read-only file system", String(take!(stderr)))
-                    @test !isfile(joinpath(dir, "read_only", "science"))
-
-                    # A read-write mount, on the other hand, will be permanent, and visible to the host
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /read_write/science && cat /read_write/science"`)
-                    @test String(take!(stdout)) == "aperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                    @test isfile(joinpath(dir, "read_write", "science"))
-
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /read_write/science && cat /read_write/science"`)
-                    @test String(take!(stdout)) == "aperture\naperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                    @test isfile(joinpath(dir, "read_write", "science"))
-
-                    # An overlay mount allows writing and reading, but does not modify the host environment.
-                    # Because this is a non-persistent executor, changes are lost from invocation to invocation.
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /overlayed/science && cat /overlayed/science"`)
-                    @test String(take!(stdout)) == "aperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /overlayed/science && cat /overlayed/science"`)
-                    @test String(take!(stdout)) == "aperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                    @test !isfile(joinpath(dir, "overlayed", "science"))
-                end
+                write(joinpath(dir, "note.txt"), "great success")
+                p, out, err = sandbox_run(config(; mounts=["/glados" => Bind(dir)]),
+                                          `/bin/sh -c "cat /glados/note.txt; touch /glados/x"`)
+                @test !success(p)
+                @test out == "great success"
+                @test occursin("Read-only file system", err)
+                @test success(run(config(; mounts=["/glados" => Bind(dir; writable=true)]),
+                                  `/bin/sh -c "echo aperture > /glados/science.txt"`))
+                @test read(joinpath(dir, "science.txt"), String) == "aperture\n"
+                # A single file, at a destination whose parents don't exist yet
+                p, out, err = sandbox_run(config(; mounts=["/does/not/exist" => Bind(joinpath(dir, "note.txt"))]),
+                                          `/bin/cat /does/not/exist`)
+                @test (success(p), out) == (true, "great success")
+                # Optional sources may be missing
+                p, out, err = sandbox_run(config(; mounts=["/m" => Bind(joinpath(dir, "nope"); optional=true)]),
+                                          `/bin/sh -c "test -e /m || echo skipped"`)
+                @test (success(p), out) == (true, "skipped\n")
+                @test sandbox_run(config(; mounts=["/m" => Bind(joinpath(dir, "nope"))]), `/bin/true`)[1].exitcode == 125
             end
         end
 
-        @testset "entrypoint" begin
+        @testset "devices" begin
+            # Device nodes only work in binds that ask for them, such as the default ones
+            p, out, err = sandbox_run(config(; mounts=["/null" => Bind("/dev/null"; writable=true)]),
+                                      `/bin/sh -c "echo > /null"`)
+            @test !success(p)
+            @test occursin("Permission denied", err)
+            @test success(run(config(; mounts=["/null" => Bind("/dev/null"; writable=true, devices=true)]),
+                              `/bin/sh -c "echo > /null && echo > /dev/null"`))
+        end
+
+        @testset "defaults" begin
+            p, out, err = sandbox_run(config(), `/bin/ls /dev`)
+            @test issubset(["fd", "full", "null", "ptmx", "pts", "random", "shm", "stderr", "stdin", "stdout",
+                            "urandom", "zero"], split(out))
+            p, out, err = sandbox_run(config(), `/usr/bin/stat -f -c %T /dev /dev/shm /dev/pts`)
+            @test split(out) == ["tmpfs", "tmpfs", "devpts"]
+            # A mount replaces the default at its destination
+            script = "dd if=/dev/zero of=/dev/shm/blob bs=1M count=16"
+            @test success(run(config(; mounts=["/dev/shm" => Tmpfs(size="32M", mode=0o1777)]), `/bin/sh -c $(script)`))
+            p, out, err = sandbox_run(config(; mounts=["/dev/shm" => Tmpfs(size="8M", mode=0o1777)]), `/bin/sh -c $(script)`)
+            @test !success(p)
+            @test occursin("No space left on device", err)
+            # Without the defaults, /dev is the rootfs's
+            p, out, err = sandbox_run(config(; defaults=false), `/usr/bin/stat -f -c %T /dev`)
+            @test (success(p), out) == (true, "overlayfs\n")
+        end
+
+        @testset "symlinks" begin
+            p, out, err = sandbox_run(config(; mounts=["/etc/alias" => Symlink("hostname")]), `/bin/cat /etc/alias`)
+            @test success(p)
+            @test out == read(joinpath(rootfs_dir, "etc", "hostname"), String)
+        end
+
+        @testset "overlays, without persist" begin
             mktempdir() do dir
-                read_only_dir = joinpath(dir, "read_only")
-                mkdir(read_only_dir)
-                stdout = IOBuffer()
-                stderr = IOBuffer()
-                config = SandboxConfig(
-                    Dict("/" => rootfs_dir, "/read_only" => read_only_dir),
-                    entrypoint = "/read_only/entrypoint",
-                    stdout = stdout,
-                    stderr = stderr,
-                    persist = false,
-                )
-
-                # Generate an `entrypoint` script that mounts a tmpfs-backed overlayfs over our read-only mounts
-                # Allowing us to write to those read-only mounts, but the changes are temporary
-                open(joinpath(read_only_dir, "entrypoint"), write=true) do io
-                    write(io, """
-                    #!/bin/sh
-
-                    echo entrypoint activated
-
-                    mkdir /overlay_workdir
-                    mount -t tmpfs -osize=1G tmpfs /overlay_workdir
-                    mkdir -p /overlay_workdir/upper
-                    mkdir -p /overlay_workdir/work
-                    mount -t overlay overlay -olowerdir=/read_only -oupperdir=/overlay_workdir/upper -oworkdir=/overlay_workdir/work /read_only
-
-                    exec "\$@"
-                    """)
+                mounts = ["/overlayed" => Overlay(dir)]
+                for _ in 1:2
+                    # Changes to the rootfs and overlays are gone after each run
+                    p, out, err = sandbox_run(config(; mounts),
+                        `/bin/sh -c "echo aperture >> /bin/science; echo aperture >> /overlayed/science; cat /bin/science /overlayed/science"`)
+                    @test (success(p), out, err) == (true, "aperture\naperture\n", "")
                 end
-                chmod(joinpath(read_only_dir, "entrypoint"), 0o755)
-
-                # Modifying the read-only files now works, and is temporary
-                with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /read_only/science && cat /read_only/science"`)
-                    @test String(take!(stdout)) == "entrypoint activated\naperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                    @test success(exe, config, `/bin/sh -c "echo aperture >> /read_only/science && cat /read_only/science"`)
-                    @test String(take!(stdout)) == "entrypoint activated\naperture\n";
-                    @test print_if_nonempty(take!(stderr))
-                end
+                @test isempty(readdir(dir))
+                @test !ispath(joinpath(rootfs_dir, "bin", "science"))
             end
         end
 
-        # A read-only overlay of another directory at the same place shows what an earlier
-        # overlay there persisted (BinaryBuilder2 reads the results of a build this way).
-        # Docker doesn't support read-only overlays.
-        executor == DockerExecutor || @testset "read-only view of persisted changes" begin
-            mktempdir() do dir
-                mkdir(joinpath(dir, "lower"))
-                mkdir(joinpath(dir, "empty"))
-                write(joinpath(dir, "lower", "f"), "lower\n")
-                stdout = IOBuffer()
-                config(type, src) = SandboxConfig(
-                    Dict("/" => MountInfo(rootfs_dir, MountType.Overlayed),
-                         "/o" => MountInfo(joinpath(dir, src), type));
-                    stdout, persist=true,
-                )
-                with_executor(executor) do exe
-                    @test success(exe, config(MountType.Overlayed, "lower"), `/bin/sh -c "echo changed > /o/f"`)
-                    @test success(exe, config(MountType.OverlayedReadOnly, "empty"), `/bin/cat /o/f`)
-                    @test String(take!(stdout)) == "changed\n"
-                end
-            end
+        @testset "tmpfs_size" begin
+            script = "dd if=/dev/zero of=/sample bs=50M count=1"
+            @test success(run(config(; tmpfs_size="1G"), `/bin/sh -c "$(script) 2>/dev/null"`))
+            p, out, err = sandbox_run(config(; tmpfs_size="10M"), `/bin/sh -c $(script)`)
+            @test !success(p)
+            @test occursin("No space left on device", err)
         end
 
         @testset "persistence" begin
             mktempdir() do dir
-                stdout = IOBuffer()
-                stderr = IOBuffer()
-                config = SandboxConfig(
-                    Dict(
-                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
-                        "/overlayed" => MountInfo(dir, MountType.Overlayed),
-                    ),
-                    stdout = stdout,
-                    stderr = stderr,
-                    persist = true,
-                )
-
-                # Modifying the rootfs or the overlay mount is persistent within a single executor
-                for prefix in ("/bin", "/overlayed")
-                    cmd = `/bin/sh -c "echo aperture >> $prefix/science && cat $prefix/science"`
-                    with_executor(executor) do exe
-                        @test success(exe, config, cmd)
-                        @test String(take!(stdout)) == "aperture\n";
-                        @test print_if_nonempty(take!(stderr))
-                        @test success(exe, config, cmd)
-                        @test String(take!(stdout)) == "aperture\naperture\n";
-                        @test print_if_nonempty(take!(stderr))
-                        @test !isfile(joinpath(dir, "science"))
-                    end
-
-                    with_executor(executor) do exe
-                        @test success(exe, config, cmd)
-                        @test String(take!(stdout)) == "aperture\n";
-                        @test print_if_nonempty(take!(stderr))
-                        @test !isfile(joinpath(dir, "science"))
-                    end
+                mkdir(joinpath(dir, "lower"))
+                mkdir(joinpath(dir, "empty"))
+                persist = new_persist_dir()
+                try
+                    cfg(mounts...) = config(; persist, mounts=collect(mounts))
+                    cmd = `/bin/sh -c "echo aperture >> /bin/science; echo aperture >> /o/science; cat /bin/science /o/science"`
+                    @test sandbox_run(cfg("/o" => Overlay(joinpath(dir, "lower"))), cmd)[2] == "aperture\n"^2
+                    @test sandbox_run(cfg("/o" => Overlay(joinpath(dir, "lower"))), cmd)[2] == "aperture\n"^4
+                    @test isempty(readdir(joinpath(dir, "lower")))
+                    # A read-only overlay of another directory at the same place shows what
+                    # was persisted there (BinaryBuilder2 reads the results of a build so)
+                    p, out, err = sandbox_run(cfg("/o" => Overlay(joinpath(dir, "empty"); readonly=true)),
+                                              `/bin/sh -c "cat /o/science; touch /o/x"`)
+                    @test out == "aperture\n"^2
+                    @test occursin("Read-only file system", err)
+                finally
+                    remove_persist(persist, mode)
                 end
+                @test !ispath(persist)
             end
         end
 
-        @testset "explicit user and group" begin
-            for (uid,gid) in [(0,0), (999,0), (0,999), (999,999)]
-                stdout = IOBuffer()
-
-                config = SandboxConfig(
-                    Dict("/" => rootfs_dir);
-                    stdout, uid, gid
-                )
-                with_executor(executor) do exe
-                    @test success(exe, config, `/usr/bin/id`)
-                    str = String(take!(stdout))
-                    @test contains(str, "uid=$(uid)")
-                    @test contains(str, "gid=$(gid)")
-                end
+        @testset "user and group" begin
+            for (uid, gid) in [(0, 0), (999, 0), (0, 999), (999, 999)]
+                p, out, err = sandbox_run(config(; uid, gid), `/usr/bin/id`)
+                @test occursin("uid=$(uid)", out)
+                @test occursin("gid=$(gid)", out)
             end
         end
 
-        # If we have the docker executor available (necessary to do the initial pull),
-        # let's test launching off of a docker image.  Only run this on x86_64 because
-        # docker doesn't (yet) have images with this name for other architectures.
-        if executor_available(DockerExecutor) && arch(HostPlatform()) == "x86_64"
-            julia_rootfs = Sandbox.pull_docker_image("julia:alpine")
-            @testset "launch from docker image" begin
-                stdout = IOBuffer()
-                stderr = IOBuffer()
-                config = SandboxConfig(
-                    Dict("/" => julia_rootfs),
-                    Dict{String,String}(),
-                    # Add the path to `julia` onto the path, then use `sh` to process the PATH
-                    Dict("PATH" => "/usr/local/julia/bin:/usr/local/bin:/usr/bin:/bin");
-                    stdout = stdout,
-                    stderr = stderr,
-                )
-
-                with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "julia -e 'println(\"Hello, Julia!\")'"`)
-                    @test String(take!(stdout)) == "Hello, Julia!\n";
-                    @test print_if_nonempty(take!(stderr))
-                end
-            end
+        @testset "cwd" begin
+            @test sandbox_run(config(; cwd="/does/not/exist"), `/bin/pwd`)[2] == "/does/not/exist\n"
         end
 
         @testset "hostname" begin
-            stdout = IOBuffer()
+            @test sandbox_run(config(; hostname="sandy"), `/bin/uname -n`)[2] == "sandy\n"
+        end
 
-            config = SandboxConfig(
-                Dict("/" => rootfs_dir);
-                stdout,
-                hostname="sandy",
-            )
-            with_executor(executor) do exe
-                @test success(exe, config, `/bin/uname -n`)
-                @test chomp(String(take!(stdout))) == "sandy"
-            end
+        # Under sudo, the launcher's parent is sudo, which handles signals itself
+        mode == :userns && @testset "signals" begin
+            # Killing the command is seen as such
+            @test run(config(), ignorestatus(`/bin/sh -c "kill -s TERM \$\$"`)).termsignal == Base.SIGTERM
+
+            # Signals for the launcher reach the command
+            out = IOBuffer()
+            script = """
+                trap "echo received SIGINT" INT
+                trap "echo received SIGTERM ; trap - TERM; kill -s TERM \$\$" TERM
+                echo ready
+                sleep 2 & wait; sleep 2 & wait
+                """
+            p = run(pipeline(command(config(), ignorestatus(`/bin/sh -c $(script)`)); stdout=out); wait=false)
+            while !occursin("ready", String(copy(out.data[1:out.size]))); sleep(0.01); end
+            kill(p, Base.SIGINT)
+            sleep(0.1)
+            kill(p, Base.SIGTERM)
+            wait(p)
+            @test p.termsignal == Base.SIGTERM
+            @test String(take!(out)) == "ready\nreceived SIGINT\nreceived SIGTERM\n"
         end
 
         @testset "Internet access" begin
             mktempdir() do rw_dir
-                ro_mappings = Dict(
-                    "/" => rootfs_dir,
-                )
-
-                # Mount in `/etc/resolv.conf` as a read-only mount if using a UserNS executor, so that we have DNS
-                if executor <: UserNamespacesExecutor && isfile("/etc/resolv.conf")
-                    resolv_conf = joinpath(rw_dir, "resolv.conf")
-                    cp("/etc/resolv.conf", resolv_conf; follow_symlinks=true)
-                    ro_mappings["/etc/resolv.conf"] = resolv_conf
-                end
-
-                # Do a test with the debian rootfs where we try to use `apt` to install `curl`, then use that to download something.
+                # Mount in `/etc/resolv.conf`, so that we have DNS
+                resolv_conf = joinpath(rw_dir, "resolv.conf")
+                cp("/etc/resolv.conf", resolv_conf; follow_symlinks=true)
                 socrates_url = "https://github.com/staticfloat/small_bin/raw/master/socrates.tar.xz"
                 socrates_hash = "61bcf109fcb749ee7b6a570a6057602c08c836b6f81091eab7aa5f5870ec6475"
-                config = SandboxConfig(
-                    ro_mappings,
-                    Dict("/tmp/rw_dir" => rw_dir),
-                    Dict("HOME" => "/root");
-                    verbose = true,
-                )
-                with_executor(executor) do exe
-                    @test success(exe, config, `/bin/sh -c "apt update && apt install -y curl && curl -L $(socrates_url) -o /tmp/rw_dir/$(basename(socrates_url))"`)
+                # apt needs xattrs in the overlay, which the tmpfs only has without
+                # root since Linux 6.6
+                persist = new_persist_dir()
+                cfg = config(; env=Dict("PATH" => default_path, "HOME" => "/root"), persist,
+                             mounts=["/etc/resolv.conf" => Bind(resolv_conf), "/tmp/rw_dir" => Bind(rw_dir; writable=true)])
+                try
+                    @test success(pipeline(command(cfg, `/bin/sh -c "apt update && apt install -y curl && curl -L $(socrates_url) -o /tmp/rw_dir/$(basename(socrates_url))"`);
+                                           stdout=devnull, stderr=devnull))
+                finally
+                    remove_persist(persist, mode)
                 end
                 socrates_path = joinpath(rw_dir, basename(socrates_url))
                 @test isfile(socrates_path)
@@ -454,18 +207,42 @@ for executor in all_executors
     end
 end
 
+@testset "persist directories" begin
+    for mode in modes
+        dir = Sandbox.scratch_persist_dir()
+        @test isdir(dir)
+        @test Sandbox.probe_persist(dir; rootfs=rootfs_dir, mode)
+        @test isempty(readdir(dir))
+        # A probe that fails cleans up as well
+        @test !Sandbox.probe_persist(dir; rootfs=joinpath(dir, "nope"), mode)
+        @test isempty(readdir(dir))
+        rm(dir)
+    end
 
-@testset "default executor" begin
-    stdout = IOBuffer()
-    stderr = IOBuffer()
-    config = SandboxConfig(
-        Dict("/" => rootfs_dir);
-        stdout,
-        stderr,
-    )
-    with_executor() do exe
-        @test success(exe, config, `/bin/sh -c "echo stdout; echo stderr >&2"`)
-        @test String(take!(stdout)) == "stdout\n";
-        @test String(take!(stderr)) == "stderr\n";
+    # What overlayfs and the sandbox leave behind can be removed, and nothing is
+    # changed through symlinks
+    mktempdir() do dir
+        victim = joinpath(dir, "victim")
+        write(victim, "")
+        chmod(victim, 0o400)
+        persist = mkpath(joinpath(dir, "persist", "work", "rootfs", "work"))
+        chmod(persist, 0o000)
+        symlink(victim, joinpath(dir, "persist", "link"))
+        symlink("/does/not/exist", joinpath(dir, "persist", "dangling"))
+        symlink(joinpath(dir, "persist"), joinpath(dir, "alias"))
+        write(joinpath(dir, "persist", "file"), "")
+        for alias in ("alias", "alias/", "alias/.", "alias//")
+            @test_throws ArgumentError Sandbox.remove_persist(joinpath(dir, alias))
+        end
+        @test isfile(joinpath(dir, "persist", "file"))
+        cd(joinpath(dir, "persist")) do
+            @test_throws ArgumentError Sandbox.remove_persist("")
+            @test_throws ArgumentError Sandbox.remove_persist("/")
+        end
+        @test isfile(joinpath(dir, "persist", "file"))
+        @test_throws ArgumentError Sandbox.remove_persist(joinpath(dir, "persist"); mode=:root)
+        Sandbox.remove_persist(joinpath(dir, "persist"))
+        @test !ispath(joinpath(dir, "persist"))
+        @test filemode(victim) & 0o777 == 0o400
     end
 end
