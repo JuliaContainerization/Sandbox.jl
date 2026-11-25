@@ -262,6 +262,83 @@ for executor in all_executors
             end
         end
 
+        @testset "Overlayed mounts with several host paths" begin
+            mktempdir() do dir
+                base, lower, upper = (joinpath(dir, d) for d in ("base", "lower", "upper"))
+                for (d, files) in ((base, ("a", "b")), (lower, ("a", "c")), (upper, ("c",)))
+                    mkpath(d)
+                    for f in files
+                        write(joinpath(d, f), "$(basename(d)) $(f)\n")
+                    end
+                end
+                stdout = IOBuffer()
+                config = SandboxConfig(
+                    Dict(
+                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                        "/data" => MountInfo([upper, lower, base], MountType.Overlayed),
+                    );
+                    stdout,
+                    persist=true,
+                )
+                with_executor(executor) do exe
+                    # Each file comes from the topmost host path that has it
+                    @test success(exe, config, `/bin/sh -c "cat /data/a /data/b /data/c"`)
+                    @test String(take!(stdout)) == "lower a\nbase b\nupper c\n"
+
+                    # A shadowed file can be replaced the way `ldconfig` does it, without
+                    # changing the host paths
+                    @test success(exe, config, `/bin/sh -c "echo new > /data/a~ && mv /data/a~ /data/a && cat /data/a"`)
+                    @test String(take!(stdout)) == "new\n"
+                    @test read(joinpath(base, "a"), String) == "base a\n"
+                    @test read(joinpath(lower, "a"), String) == "lower a\n"
+                    @test !ispath(joinpath(base, "a~")) && !ispath(joinpath(lower, "a~"))
+
+                    # The change persists into the next run of the same executor
+                    @test success(exe, config, `/bin/sh -c "cat /data/a /data/c"`)
+                    @test String(take!(stdout)) == "new\nupper c\n"
+                end
+
+                # but a fresh executor starts from the host paths again
+                with_executor(executor) do exe
+                    @test success(exe, config, `/bin/sh -c "cat /data/a"`)
+                    @test String(take!(stdout)) == "lower a\n"
+                end
+            end
+        end
+
+        @testset "Overlay at /etc with an extra lower directory" begin
+            mktempdir() do dir
+                layer = joinpath(dir, "layer")
+                mkpath(layer)
+                write(joinpath(layer, "debian_version"), "layered\n")
+                conf = joinpath(dir, "extra.conf")
+                write(conf, "extra\n")
+                stdout = IOBuffer()
+                etc_dir = joinpath(rootfs_dir, "etc")
+                debian_version = read(joinpath(etc_dir, "debian_version"), String)
+                config = SandboxConfig(
+                    Dict(
+                        "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                        "/etc" => MountInfo([layer, etc_dir], MountType.Overlayed),
+                        "/etc/extra.conf" => MountInfo(conf, MountType.ReadOnly),
+                    );
+                    stdout,
+                    persist=true,
+                )
+                with_executor(executor) do exe
+                    # `layer` shadows the rootfs's `/etc`, the rest of which shows through
+                    @test success(exe, config, `/bin/sh -c "cat /etc/debian_version /etc/extra.conf && grep -c '^root:' /etc/passwd"`)
+                    @test String(take!(stdout)) == "layered\nextra\n1\n"
+
+                    @test success(exe, config, `/bin/sh -c "echo updated > /etc/debian_version~ && mv /etc/debian_version~ /etc/debian_version"`)
+                    @test success(exe, config, `/bin/sh -c "cat /etc/debian_version"`)
+                    @test String(take!(stdout)) == "updated\n"
+                end
+                @test read(joinpath(layer, "debian_version"), String) == "layered\n"
+                @test read(joinpath(etc_dir, "debian_version"), String) == debian_version
+            end
+        end
+
         @testset "entrypoint" begin
             mktempdir() do dir
                 read_only_dir = joinpath(dir, "read_only")

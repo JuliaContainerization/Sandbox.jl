@@ -58,7 +58,12 @@ enum {
 // Linked list of volume mappings
 struct mount_list {
     char *mount_point;
-    char *outside_path;
+    // The outside paths: the lower directories of an overlayed mount, topmost first,
+    // or the one path that other mounts bind-mount.  `from_fds` holds an overlay's
+    // lower directories open while the mounts are being set up.
+    char **froms;
+    int *from_fds;
+    size_t num_froms;
     int type;
     struct mount_list *prev;
 };
@@ -131,6 +136,24 @@ static void mount_the_world(const char * root_dir,
   // the sandbox.
   check(0 == mount(NULL, "/", NULL, MS_PRIVATE|MS_REC, NULL));
 
+  // The lower directories of overlayed mounts are host paths, which the tmpfs and the
+  // overlays mounted below may cover, so open them first.
+  for (struct mount_list *entry = maps; entry != NULL; entry = entry->prev) {
+    if (entry->type != MOUNT_TYPE_OVERLAYED && entry->type != MOUNT_TYPE_OVERLAYED_READONLY) {
+      continue;
+    }
+    for (size_t i = 0; i < entry->num_froms; i++) {
+      int fd = open(entry->froms[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
+      if (fd == -1) {
+        fprintf(stderr, "ERROR: Failed to open '%s' to mount it at '%s': %s (errno %d)\n",
+                entry->froms[i], entry->mount_point, strerror(errno), errno);
+        fprintf(stderr, "  Please ensure that '%s' is an accessible directory.\n", entry->froms[i]);
+        _exit(EXIT_SANDBOX_FAILED);
+      }
+      entry->from_fds[i] = fd;
+    }
+  }
+
   // If `persist_dir` is specified, it represents a host directory that should
   // be used to store our overlayfs work data.  This is where modifications to
   // the rootfs and such will go.  Typically, these should be ephemeral (and if
@@ -189,7 +212,7 @@ static void mount_the_world(const char * root_dir,
   // their source instead: the device nodes we bind from the host's /dev must keep
   // working.
   const unsigned long overlay_flags = MS_NODEV | MS_NOSUID;
-  check(TRUE == mount_overlay(lower_dir, root_dir, "rootfs", persist_dir, userxattr, overlay_flags));
+  check(TRUE == mount_overlay(&lower_dir, 1, root_dir, "rootfs", persist_dir, userxattr, overlay_flags));
   int root_fd = open_root(root_dir);
 
   // Chown this directory to the desired UID/GID, so that it doesn't look like it's
@@ -199,21 +222,33 @@ static void mount_the_world(const char * root_dir,
   // Mount all of our mounts
   struct mount_list *entry = maps;
   while (entry != NULL) {
-    // bind-mount the outside path to the inside path,
-    // setting the bind-mount to be read-only if requested.
-    bind_mount(root_fd,
-               entry->outside_path,
-               entry->mount_point,
-               entry->type == MOUNT_TYPE_READONLY || entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY);
-
-    // If we're dealing with an overlayed mount, create a unique
-    // name to store the state of this mount within our `persist_dir`.
-    if (entry->type == MOUNT_TYPE_OVERLAYED || entry->type == MOUNT_TYPE_OVERLAYED_READONLY) {
+    if (entry->type != MOUNT_TYPE_OVERLAYED && entry->type != MOUNT_TYPE_OVERLAYED_READONLY) {
+      // bind-mount the outside path to the inside path,
+      // setting the bind-mount to be read-only if requested.
+      bind_mount(root_fd, entry->froms[0], entry->mount_point,
+                 entry->type == MOUNT_TYPE_READONLY);
+    } else {
+      // Mount an overlay of the outside paths at the inside path, storing its state
+      // under a unique name within our `persist_dir`.
       char bname[PATH_MAX], path[FD_PATH_SIZE];
       hashed_basename(&bname[0], entry->mount_point);
-      int fd = open_in_root_or_die(root_fd, entry->mount_point, 0);
+      int fd = open_in_root_or_die(root_fd, entry->mount_point, S_IFDIR);
+      check_not_root(root_fd, fd, entry->mount_point);
       fd_path(path, fd);
-      check(TRUE == mount_overlay(path, path, bname, persist_dir, userxattr, overlay_flags));
+      char (*lower_paths)[FD_PATH_SIZE] = calloc(entry->num_froms, FD_PATH_SIZE);
+      const char **lowers = calloc(entry->num_froms, sizeof(char *));
+      check(lower_paths != NULL && lowers != NULL);
+      for (size_t i = 0; i < entry->num_froms; i++) {
+        fd_path(lower_paths[i], entry->from_fds[i]);
+        lowers[i] = lower_paths[i];
+      }
+      check(TRUE == mount_overlay(lowers, entry->num_froms, path, bname, persist_dir, userxattr, overlay_flags));
+      for (size_t i = 0; i < entry->num_froms; i++) {
+        close(entry->from_fds[i]);
+        entry->from_fds[i] = -1;
+      }
+      free(lowers);
+      free(lower_paths);
       close(fd);
 
       // Each mount is stacked on what the path led to before, so look it up again.
@@ -512,6 +547,7 @@ static void print_help() {
   fputs("Usage: sandbox --rootfs <dir> [--cd <dir>] ", stderr);
   fputs("[--map <from>:<to>, --map <from>:<to>, ...] ", stderr);
   fputs("[--workspace <from>:<to>, --workspace <from>:<to>, ...] ", stderr);
+  fputs("[--mount <from>[:<from>...]:<to>[:<type>], ...] ", stderr);
   fputs("[--persist <work_dir>] ", stderr);
   fputs("[--entrypoint <exe_path>] ", stderr);
   fputs("[--userxattr] ", stderr);
@@ -643,28 +679,27 @@ int main(int sandbox_argc, char **sandbox_argv) {
         }
         break;
       case 'm': {
-        // Find the colon in "from:to"
-        char *colon = strchr(optarg, ':');
-        if (colon == NULL) {
-          fprintf(stderr, "ERROR: --mount \"%s\" is not of the form <from>:<to>[:<type>]!\n", optarg);
-          return EXIT_SANDBOX_FAILED;
+        // Parse "<from>[:<from>...]:<to>[:<type>]".  Several `from`s are the lower
+        // directories of an overlay, listed as overlayfs lists them: topmost first.  `to`
+        // is absolute, so a last part that isn't is the mount type.
+        char *spec = strdup(optarg);
+        size_t num_parts = 1;
+        for (char *c = spec; *c != '\0'; c++) {
+          num_parts += (*c == ':');
+        }
+        char **parts = (char **) malloc(num_parts * sizeof(char *));
+        check(spec != NULL && parts != NULL);
+        parts[0] = spec;
+        for (size_t i = 1; i < num_parts; i++) {
+          parts[i] = strchr(parts[i-1], ':');
+          *parts[i] = '\0';
+          parts[i]++;
         }
 
-        // Extract "from" and "to"
-        char *from = strndup(optarg, (colon - optarg));
-        char *to = strdup(colon + 1);
-        if (from[0] != '/') {
-          fprintf(stderr, "ERROR: Outside path \"%s\" must be absolute!\n", from);
-          return EXIT_SANDBOX_FAILED;
-        }
-
-        // Look for mount options
         int mount_type = MOUNT_TYPE_READWRITE;
-        char *mount_str = strchr(to, ':');
-        if (mount_str != NULL) {
-          // Chop off the colon so `to` is NULL-terminated.
-          *mount_str = '\0';
-          mount_str++;
+        char *mount_str = NULL;
+        if (num_parts > 1 && parts[num_parts-1][0] != '/') {
+          mount_str = parts[--num_parts];
           if (strcmp(mount_str, "ro") == 0) {
             mount_type = MOUNT_TYPE_READONLY;
           } else if (strcmp(mount_str, "ov") == 0) {
@@ -674,22 +709,46 @@ int main(int sandbox_argc, char **sandbox_argv) {
           } else if (strcmp(mount_str, "rw") == 0) {
             mount_type = MOUNT_TYPE_READWRITE;
           } else {
-            fprintf(stderr, "ERROR: Unknown mount type in \"%s\" -> \"%s\" with type \"%s\"!\n", from, to, mount_str);
+            fprintf(stderr, "ERROR: Unknown mount type \"%s\" in --mount \"%s\"!\n", mount_str, optarg);
             return EXIT_SANDBOX_FAILED;
           }
         }
+        if (num_parts < 2) {
+          fprintf(stderr, "ERROR: --mount \"%s\" is not of the form <from>[:<from>...]:<to>[:<type>]!\n", optarg);
+          return EXIT_SANDBOX_FAILED;
+        }
+        size_t num_froms = num_parts - 1;
+        for (size_t i = 0; i < num_froms; i++) {
+          if (parts[i][0] != '/') {
+            fprintf(stderr, "ERROR: Outside path \"%s\" must be absolute!\n", parts[i]);
+            return EXIT_SANDBOX_FAILED;
+          }
+        }
+        if (num_froms > 1 && mount_type != MOUNT_TYPE_OVERLAYED && mount_type != MOUNT_TYPE_OVERLAYED_READONLY) {
+          fprintf(stderr, "ERROR: --mount \"%s\" has several outside paths, which only overlayed (:ov or :rov) mounts can have!\n", optarg);
+          return EXIT_SANDBOX_FAILED;
+        }
 
-        // Construct `mount_list` object for this `from:to:type` pair
+        // Construct `mount_list` object for this mount
         struct mount_list *entry = (struct mount_list *) malloc(sizeof(struct mount_list));
-        entry->mount_point = to;
-        entry->outside_path = from;
+        check(entry != NULL);
+        entry->mount_point = parts[num_froms];
+        entry->froms = parts;
+        entry->num_froms = num_froms;
+        entry->from_fds = (int *) malloc(num_froms * sizeof(int));
+        check(entry->from_fds != NULL);
+        for (size_t i = 0; i < num_froms; i++) {
+          entry->from_fds[i] = -1;
+        }
         entry->type = mount_type;
         entry->prev = mounts;
         mounts = entry;
 
         if (verbose) {
-          fprintf(stderr, "Parsed --mount as \"%s\" -> \"%s\" (\"%s\")\n",
-                  entry->outside_path, entry->mount_point, mount_str);
+          for (size_t i = 0; i < num_froms; i++) {
+            fprintf(stderr, "Parsed --mount as \"%s\" -> \"%s\" (\"%s\")\n",
+                    entry->froms[i], entry->mount_point, mount_str);
+          }
         }
       } break;
       case 'p':

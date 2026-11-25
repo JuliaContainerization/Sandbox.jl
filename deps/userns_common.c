@@ -372,34 +372,37 @@ void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid,
 
 
 /*
- * Mount an overlayfs from `src` onto `dest`, anchoring the changes made to the overlayfs
- * within the folders `work_dir`/upper and `work_dir`/work.  Note that the common case of
- * `src` == `dest` signifies that we "shadow" the original source location and will simply
- * discard any changes made to it when the overlayfs disappears.  This is how we protect our
- * rootfs and shards when mounting from a local filesystem, as well as how we convert a
- * read-only rootfs and shards to a read-write system when mounting from squashfs images.
+ * Mount an overlayfs of the `num_lowers` directories `lowers` (topmost first, as overlayfs
+ * lists them) onto `dest`, anchoring the changes made to the overlayfs within the folders
+ * `work_dir`/upper/`bname` and `work_dir`/work/`bname`.  Note that the common case of a
+ * single lower directory that is `dest` signifies that we "shadow" the original source
+ * location and will simply discard any changes made to it when the overlayfs disappears.
+ * This is how we protect our rootfs and shards when mounting from a local filesystem, as
+ * well as how we convert a read-only rootfs and shards to a read-write system when
+ * mounting from squashfs images.
  * `flags` are the mount flags for mount(2).
  */
-uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
-                      const char * work_dir, uint8_t userxattr, unsigned long flags) {
-  char upper[PATH_MAX], work[PATH_MAX], opts[3*PATH_MAX+28];
+uint8_t mount_overlay(const char * const * lowers, size_t num_lowers, const char * dest,
+                      const char * bname, const char * work_dir, uint8_t userxattr,
+                      unsigned long flags) {
+  char upper[PATH_MAX], work[PATH_MAX];
 
   // Construct the location of our upper and work directories
   snprintf(upper, sizeof(upper), "%s/upper/%s", work_dir, bname);
   snprintf(work, sizeof(work), "%s/work/%s", work_dir, bname);
 
-  // If `src` or `dest` is "", we actually want it to be "/", so adapt here because
-  // this is the only place in the code base where we actually need the slash at the
-  // end of the directory name.
-  if (src[0] == '\0') {
-    src = "/";
-  }
+  // If a lower directory or `dest` is "", we actually want it to be "/", so adapt here
+  // because this is the only place in the code base where we actually need the slash at
+  // the end of the directory name.
   if (dest[0] == '\0') {
     dest = "/";
   }
 
   if (verbose) {
-    fprintf(stderr, "--> Mounting overlay of %s at %s (modifications in %s, workspace in %s, userxattr: %d)\n", src, dest, upper, work, userxattr);
+    fprintf(stderr, "--> Mounting overlay at %s (modifications in %s, workspace in %s, userxattr: %d) of:\n", dest, upper, work, userxattr);
+    for (size_t i = 0; i < num_lowers; i++) {
+      fprintf(stderr, "----> %s\n", lowers[i][0] == '\0' ? "/" : lowers[i]);
+    }
   }
 
   // Make the upper and work directories
@@ -411,17 +414,35 @@ uint8_t mount_overlay(const char * src, const char * dest, const char * bname,
   if (userxattr) {
     userxattr_opt = ",userxattr";
   }
-  snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s,workdir=%s%s", src, upper, work, userxattr_opt);
-  
+  size_t opts_size = strlen(upper) + strlen(work) + strlen(userxattr_opt) + 32;
+  for (size_t i = 0; i < num_lowers; i++) {
+    opts_size += strlen(lowers[i]) + 2;
+  }
+  char * opts = malloc(opts_size);
+  check(opts != NULL);
+  size_t len = 0;
+  int n = snprintf(opts, opts_size, "lowerdir=");
+  check(n > 0 && (size_t)n < opts_size);
+  len = n;
+  for (size_t i = 0; i < num_lowers; i++) {
+    n = snprintf(opts + len, opts_size - len, "%s%s", i == 0 ? "" : ":",
+                 lowers[i][0] == '\0' ? "/" : lowers[i]);
+    check(n > 0 && (size_t)n < opts_size - len);
+    len += n;
+  }
+  n = snprintf(opts + len, opts_size - len, ",upperdir=%s,workdir=%s%s", upper, work, userxattr_opt);
+  check(n > 0 && (size_t)n < opts_size - len);
+
   // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
+  uint8_t ok = TRUE;
   if (0 != mount("overlay", dest, "overlay", flags, opts)) {
     if (verbose) {
       fprintf(stderr, "----> mount(\"overlay\", \"%s\", \"overlay\", %lu, \"%s\") failed: %d (%s)\n", dest, flags, opts, errno, strerror(errno));
     }
-    return FALSE;
+    ok = FALSE;
   }
-
-  return TRUE;
+  free(opts);
+  return ok;
 }
 
 /**** Read-only mounts *****
@@ -658,6 +679,19 @@ void mount_procfs(const char * root_dir, uid_t uid, gid_t gid) {
 }
 
 /*
+ * A destination such as `/a/..`, or a symlink to `/`, would cover the root itself, which
+ * the rest of the setup (going through `root_fd`) would no longer see.
+ */
+void check_not_root(int root_fd, int dest_fd, const char *dest) {
+  struct stat dest_stat, root_stat;
+  check(0 == fstat(dest_fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
+  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
+    fprintf(stderr, "ERROR: Failed to mount at '%s': it is the root of the sandbox\n", dest);
+    _exit(EXIT_SANDBOX_FAILED);
+  }
+}
+
+/*
  * Bind-mounts the host path `src` (or a /proc/self/fd path) at `dest` in the rootfs
  * `root_fd`, creating the mount point as a directory or file to match `src`.
  */
@@ -683,14 +717,7 @@ void bind_mount(int root_fd, const char *src, const char *dest, char read_only) 
   int dest_fd = open_in_root_or_die(root_fd, dest, S_ISDIR(src_stat.st_mode) ? S_IFDIR : S_IFREG);
   fd_path(dest_path, dest_fd);
 
-  // A destination such as `/a/..`, or a symlink to `/`, would cover the root itself,
-  // which the rest of the setup (going through `root_fd`) would no longer see.
-  struct stat dest_stat, root_stat;
-  check(0 == fstat(dest_fd, &dest_stat) && 0 == fstat(root_fd, &root_stat));
-  if (dest_stat.st_dev == root_stat.st_dev && dest_stat.st_ino == root_stat.st_ino) {
-    fprintf(stderr, "ERROR: Failed to mount '%s' to '%s': it is the root of the sandbox\n", src, dest);
-    _exit(EXIT_SANDBOX_FAILED);
-  }
+  check_not_root(root_fd, dest_fd, dest);
 
   // We don't expect workspaces to have any submounts in normal operation.
   // However, for runshell(), workspace could be an arbitrary directory,

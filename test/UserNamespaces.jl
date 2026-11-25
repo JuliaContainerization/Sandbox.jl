@@ -161,6 +161,11 @@ if UserNSSandbox_jll.is_available()
                      `--rootfs $(rootfs) --mount relative:/mnt /bin/true`,
                      `--rootfs $(rootfs) --mount /tmp:/mnt:bogus /bin/true`,
                      `--rootfs $(rootfs) --mount /tmp /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp:mnt /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp:/tmp:/mnt:ro /bin/true`,
+                     `--rootfs $(rootfs) --mount /tmp:/tmp:/mnt /bin/true`,
+                     `--rootfs $(rootfs) --mount relative:/tmp:/mnt:ov /bin/true`,
+                     `--rootfs $(rootfs) --mount /does/not/exist:/tmp:/mnt:ov /bin/true`,
                      `--rootfs /does/not/exist /bin/true`]
             p = run(pipeline(ignorestatus(`$(exe) $(args)`); stderr=devnull))
             @test p.exitcode == 125
@@ -329,6 +334,25 @@ if executor_available(UnprivilegedUserNamespacesExecutor)
             # Verify that paths are ordered by length (longest first for UserNamespaces)
             path_lengths = [length(path) for path in mount_paths]
             @test issorted(path_lengths, rev=true)
+        end
+    end
+
+    @testset "several host paths in executor commands" begin
+        mktempdir() do dir
+            upper, lower = mkpath(joinpath(dir, "upper")), mkpath(joinpath(dir, "lower"))
+            etc_dir = joinpath(rootfs_dir, "etc")
+            config = SandboxConfig(Dict(
+                "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                "/etc" => MountInfo([upper, lower, etc_dir], MountType.Overlayed),
+                "/etc/extra.conf" => MountInfo(joinpath(dir, "extra.conf"), MountType.ReadOnly),
+            ))
+            args = Sandbox.build_executor_command(UnprivilegedUserNamespacesExecutor(), config, `/bin/true`).exec
+            # The host paths are listed as overlayfs lists lower directories, topmost first
+            i = findfirst(==("--mount"), args)
+            @test args[i:i+3] == [
+                "--mount", "$(joinpath(dir, "extra.conf")):/etc/extra.conf:ro",
+                "--mount", "$(realpath(upper)):$(realpath(lower)):$(realpath(etc_dir)):/etc:ov",
+            ]
         end
     end
 else

@@ -114,6 +114,59 @@ using Test, LazyArtifacts, Sandbox
         @test_throws ArgumentError SandboxConfig(Dict("/" => rootfs_dir); entrypoint="init")
     end
 
+    @testset "MountInfo with several host paths" begin
+        # A single host path is a one-element `host_paths`
+        m = MountInfo(rootfs_dir, MountType.Overlayed)
+        @test m.host_paths == [rootfs_dir]
+        @test m.host_path == rootfs_dir
+        @test m == MountInfo([rootfs_dir], MountType.Overlayed)
+        @test hash(m) == hash(MountInfo([rootfs_dir], MountType.Overlayed))
+        @test m != MountInfo(rootfs_dir, MountType.OverlayedReadOnly)
+        @test :host_path in propertynames(m)
+
+        mktempdir() do dir
+            m = MountInfo([dir, rootfs_dir], MountType.Overlayed)
+            @test m.host_paths == [dir, rootfs_dir]
+            @test m == MountInfo([dir, rootfs_dir], MountType.Overlayed)
+            @test hash(m) == hash(MountInfo([dir, rootfs_dir], MountType.Overlayed))
+            @test m != MountInfo([rootfs_dir, dir], MountType.Overlayed)
+            @test m != MountInfo(rootfs_dir, MountType.Overlayed)
+            @test_throws ArgumentError m.host_path
+            @test MountInfo([dir, rootfs_dir], MountType.OverlayedReadOnly).host_paths == [dir, rootfs_dir]
+
+            # Only overlayed mounts can have several host paths, and every mount has one
+            @test_throws ArgumentError MountInfo([dir, rootfs_dir], MountType.ReadOnly)
+            @test_throws ArgumentError MountInfo([dir, rootfs_dir], MountType.ReadWrite)
+            @test_throws ArgumentError MountInfo(String[], MountType.Overlayed)
+
+            # All host paths are `realpath()`'ed, and must be absolute and free of colons
+            etc_dir = joinpath(rootfs_dir, "etc")
+            link = joinpath(dir, "link")
+            mkdir(joinpath(dir, "layer"))
+            symlink(joinpath(dir, "layer"), link)
+            config = SandboxConfig(Dict(
+                "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                "/etc" => MountInfo([link, etc_dir], MountType.Overlayed),
+            ))
+            @test config.mounts["/etc"].host_paths == [realpath(joinpath(dir, "layer")), realpath(etc_dir)]
+            for bad in ("layer", joinpath(dir, "a:b"))
+                @test_throws ArgumentError SandboxConfig(Dict(
+                    "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                    "/etc" => MountInfo([bad, etc_dir], MountType.Overlayed),
+                ))
+            end
+            @test_throws ArgumentError SandboxConfig(Dict(
+                "/" => MountInfo(rootfs_dir, MountType.Overlayed),
+                "/a:b" => MountInfo(dir, MountType.ReadOnly),
+            ))
+
+            # The root mount can't have several
+            @test_throws ArgumentError SandboxConfig(Dict(
+                "/" => MountInfo([dir, rootfs_dir], MountType.Overlayed),
+            ))
+        end
+    end
+
     using Sandbox: realpath_stem
     @testset "realpath_stem" begin
         mktempdir() do dir
