@@ -93,8 +93,11 @@ void setup_signal_forwarding();
 
 /* User namespaces */
 void configure_user_namespace(pid_t pid, uid_t src_uid, gid_t src_gid, uid_t dst_uid, gid_t dst_gid);
-uint8_t mount_overlay(const char * src, const char * dest, const char * bname, const char * work_dir, uint8_t userxattr, unsigned long flags);
+uint8_t mount_overlay(const char * const * lowers, size_t num_lowers, const char * dest,
+                      const char * bname, const char * work_dir, uint8_t userxattr,
+                      unsigned long flags);
 void mount_procfs(const char * root_dir, uid_t uid, gid_t gid);
 void make_readonly(int fd, const char *dest);
+void check_not_root(int root_fd, int dest_fd, const char *dest);
 void bind_mount(int root_fd, const char *src, const char *dest, char read_only);
 void bind_host_node(int root_fd, const char *name, char read_only);

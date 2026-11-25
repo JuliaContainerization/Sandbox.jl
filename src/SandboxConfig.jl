@@ -7,10 +7,49 @@ const AnyRedirectable = Union{Base.AbstractCmd, Base.TTY, <:IO}
     Overlayed
     OverlayedReadOnly
 end
+"""
+    MountInfo(host_path, type)
+    MountInfo(host_paths, type)
+
+Describes what to mount at a path in the sandbox: the host path `host_path`, mounted as
+`type` (a `MountType`).
+
+An `Overlayed` or `OverlayedReadOnly` mount can stack several host directories, given
+as `host_paths` in the order overlayfs lists its lower directories: topmost first, with
+the base directory last.  A file in a directory shadows the same file in the directories
+after it; changes made in the sandbox go into the overlay's own writable layer, as with
+any overlayed mount.  All paths must be absolute.
+
+`m.host_path` is the host path of a mount that has only one.
+"""
 struct MountInfo
-    host_path::String
+    host_paths::Vector{String}
     type::MountType.T
+
+    function MountInfo(host_paths::AbstractVector{<:AbstractString}, type::MountType.T)
+        if isempty(host_paths)
+            throw(ArgumentError("A mount needs at least one host path"))
+        end
+        if length(host_paths) > 1 && type ∉ (MountType.Overlayed, MountType.OverlayedReadOnly)
+            throw(ArgumentError("Only Overlayed and OverlayedReadOnly mounts can have several host paths, not $(type) mounts"))
+        end
+        return new(String.(host_paths), type)
+    end
 end
+MountInfo(host_path::AbstractString, type::MountType.T) = MountInfo([host_path], type)
+function Base.getproperty(m::MountInfo, name::Symbol)
+    if name === :host_path
+        host_paths = getfield(m, :host_paths)
+        if length(host_paths) != 1
+            throw(ArgumentError("This mount has $(length(host_paths)) host paths; use `host_paths`"))
+        end
+        return only(host_paths)
+    end
+    return getfield(m, name)
+end
+Base.propertynames(::MountInfo) = (:host_paths, :type, :host_path)
+Base.:(==)(a::MountInfo, b::MountInfo) = a.host_paths == b.host_paths && a.type == b.type
+Base.hash(m::MountInfo, h::UInt) = hash(m.type, hash(m.host_paths, hash(MountInfo, h)))
 export MountInfo, MountType
 
 """
@@ -100,10 +139,16 @@ struct SandboxConfig
                            stderr::AnyRedirectable = Base.stderr,
                            verbose::Bool = false)
         # Lint the maps to ensure that all are absolute paths:
-        for path in [keys(mounts)..., [v.host_path for v in values(mounts)]...,
-                     something(entrypoint, "/"), pwd]
+        host_paths = [p for v in values(mounts) for p in v.host_paths]
+        for path in [keys(mounts)..., host_paths..., something(entrypoint, "/"), pwd]
             if !startswith(path, "/")
                 throw(ArgumentError("Path mapping $(path) is not absolute!"))
+            end
+        end
+        # Executors list paths separated by colons
+        for path in [keys(mounts)..., host_paths...]
+            if occursin(':', path)
+                throw(ArgumentError("Path mapping $(path) contains a colon!"))
             end
         end
 
@@ -111,19 +156,24 @@ struct SandboxConfig
             # Force every path to be `realpath()`'ed (up to the point of existence)
             # This allows us to point to as-of-yet nonexistant files, but to collapse
             # as many symlinks as possible.
-            mount_info = MountInfo(realpath_stem(mount_info.host_path), mount_info.type)
+            mount_info = MountInfo(realpath_stem.(mount_info.host_paths), mount_info.type)
             mounts[sandbox_path] = mount_info
 
             # Disallow ecryptfs mount points, they don't play well with user namespaces.
-            crypt, mountpoint = is_ecryptfs(mount_info.host_path; verbose)
-            if crypt
-                throw(ArgumentError("Path $(mount_info.host_path) is mounted on the ecryptfs filesystem $(mountpoint)!"))
+            for path in mount_info.host_paths
+                crypt, mountpoint = is_ecryptfs(path; verbose)
+                if crypt
+                    throw(ArgumentError("Path $(path) is mounted on the ecryptfs filesystem $(mountpoint)!"))
+                end
             end
         end
 
         # Ensure that read_only_maps contains a mapping for the root in the guest:
         if !haskey(mounts, "/") || mounts["/"].type != MountType.Overlayed
             throw(ArgumentError("Must provide an overlayed root mapping!"))
+        end
+        if length(mounts["/"].host_paths) != 1
+            throw(ArgumentError("The root mapping must have a single host path; put the files in the rootfs, or overlay a subdirectory"))
         end
 
         # Collect all multiarch platforms, mapping to the known interpreter for that platform.

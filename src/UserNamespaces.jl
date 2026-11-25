@@ -179,7 +179,7 @@ function build_executor_command(exe::UserNamespacesExecutor, config::SandboxConf
         else
             throw(ArgumentError("Unknown mount type: $(mount_info.type)"))
         end
-        append!(cmd_string, ["--mount", "$(mount_info.host_path):$(sandbox_path)$(mount_type_str)"])
+        append!(cmd_string, ["--mount", "$(join(mount_info.host_paths, ':')):$(sandbox_path)$(mount_type_str)"])
     end
 
     # Add in entrypoint, if it is set
