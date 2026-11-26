@@ -1,7 +1,7 @@
 name = "Sandbox"
 uuid = "9307e30f-c43e-9ca7-d17c-c2dc59df670d"
 authors = ["Elliot Saba <staticfloat@gmail.com>"]
-version = "2.3.0"
+version = "2.3.1"
 
 [workspace]
 projects = ["test"]
