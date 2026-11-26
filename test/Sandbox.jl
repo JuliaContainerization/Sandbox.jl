@@ -280,6 +280,12 @@ for executor in all_executors
                     stdout,
                     persist=true,
                 )
+                if executor == DockerExecutor
+                    with_executor(executor) do exe
+                        @test_throws ArgumentError success(exe, config, `/bin/true`)
+                    end
+                    return
+                end
                 with_executor(executor) do exe
                     # Each file comes from the topmost host path that has it
                     @test success(exe, config, `/bin/sh -c "cat /data/a /data/b /data/c"`)
@@ -325,6 +331,12 @@ for executor in all_executors
                     stdout,
                     persist=true,
                 )
+                if executor == DockerExecutor
+                    with_executor(executor) do exe
+                        @test_throws ArgumentError success(exe, config, `/bin/true`)
+                    end
+                    return
+                end
                 with_executor(executor) do exe
                     # `layer` shadows the rootfs's `/etc`, the rest of which shows through
                     @test success(exe, config, `/bin/sh -c "cat /etc/debian_version /etc/extra.conf && grep -c '^root:' /etc/passwd"`)
