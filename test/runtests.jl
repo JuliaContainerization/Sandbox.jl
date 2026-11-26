@@ -44,13 +44,12 @@ using Test, Sandbox, Scratch
 # If we're on a UserNSSandbox_jll-compatible system, ensure that the sandbox is coming from where we expect.
 UserNSSandbox_jll = Sandbox.UserNSSandbox_jll
 if UserNSSandbox_jll.is_available()
-    Artifacts = Sandbox.UserNSSandbox_jll.Artifacts
     sandbox_path = Sandbox.UserNSSandbox_jll.sandbox_path
     @info("On a UserNSSandbox_jll-capable platform", sandbox_path)
     if should_build_local_sandbox
         @test startswith(UserNSSandbox_jll.sandbox_path, Scratch.scratch_dir())
     else
-        @test any(startswith(UserNSSandbox_jll.sandbox_path, d) for d in Artifacts.artifacts_dirs())
+        @test any(startswith(UserNSSandbox_jll.sandbox_path, joinpath(d, "artifacts")) for d in DEPOT_PATH)
     end
 end
 
