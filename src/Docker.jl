@@ -66,15 +66,12 @@ function save_timestamp(image_name::String, timestamp::Float64)
     end
 end
 
-function docker_image_name(paths, uid::Cint, gid::Cint)
-    if paths isa AbstractDict
-        paths = sort(collect(paths))
-    end
-    hash = Base._crc32c(join((string(dst, "\0", host) for (dst, host) in paths), "\0"))
+function docker_image_name(paths::Dict{String,String}, uid::Cint, gid::Cint)
+    hash = foldl(⊻, vcat(Base._crc32c.(keys(paths))..., Base._crc32c.(values(paths))))
     return "sandbox_rootfs:$(string(hash, base=16))-$(uid)-$(gid)"
 end
 docker_image_label(exe::DockerExecutor) = string("org.julialang.sandbox.jl=", exe.label)
-function should_build_docker_image(paths, uid::Cint, gid::Cint)
+function should_build_docker_image(paths::Dict{String,String}, uid::Cint, gid::Cint)
     # If the image doesn't exist at all, always return true
     image_name = docker_image_name(paths, uid, gid)
     if !success(`$(docker_exe()) image inspect $(image_name)`)
@@ -83,69 +80,7 @@ function should_build_docker_image(paths, uid::Cint, gid::Cint)
 
     # If this image has been built before, compare its historical timestamp to the current one
     prev_ctime = get(load_timestamps(), image_name, 0.0)
-    return any(max_directory_ctime(host) > prev_ctime for (_, host) in paths)
-end
-
-"""
-    docker_image_sources(mounts)
-
-Lists the host directories that make up the docker image for `mounts`, as
-`sandbox_path => host_path` pairs in the order they must be extracted: each `Overlayed`
-mount after the mounts above it, and its host paths bottommost first, so that later
-entries shadow earlier ones.
-"""
-function docker_image_sources(mounts::Dict)
-    sources = Pair{String,String}[]
-    overlayed = sort([(path, m) for (path, m) in mounts if m.type == MountType.Overlayed]; by=x->length(x[1]))
-    for (sandbox_path, m) in overlayed
-        for host_path in reverse(m.host_paths)
-            push!(sources, sandbox_path => host_path)
-        end
-    end
-    return sources
-end
-
-function add_image_member!(entries::Dict{String,Tuple{String,Bool}}, dest::String,
-                           member::String, is_dir::Bool)
-    prev = get(entries, dest, nothing)
-    if prev !== nothing && prev[2] && !is_dir
-        filter!(((k, _),) -> !startswith(k, dest * "/"), entries)
-    end
-    entries[dest] = (member, is_dir)
-end
-
-function walk_image_source!(entries::Dict{String,Tuple{String,Bool}}, i::Int,
-                            host::String, rel::String, dest::String)
-    for name in readdir(joinpath(host, rel))
-        child_rel = isempty(rel) ? name : string(rel, "/", name)
-        child_dest = isempty(dest) ? name : string(dest, "/", name)
-        is_dir = isdir(lstat(joinpath(host, child_rel)))
-        add_image_member!(entries, child_dest, string(i, "/", child_rel), is_dir)
-        if is_dir
-            walk_image_source!(entries, i, host, child_rel, child_dest)
-        end
-    end
-end
-
-"""
-    docker_image_members(sources)
-
-Lists what goes into the docker image built from `sources` (see `docker_image_sources()`),
-as paths `"<i>/<path>"` to the file at `<path>` in the `i`-th source (`"<i>/."` for the
-source itself), parents before their children.  `docker import` refuses an archive that
-holds a path twice, so each path in the image comes only from the last source that has
-it, the way overlayfs stacks layers: a file or symlink also hides what the sources before
-it have below its path.
-"""
-function docker_image_members(sources::Vector{Pair{String,String}})
-    # path in the image => (member, whether it is a directory)
-    entries = Dict{String,Tuple{String,Bool}}()
-    for (i, (dst, host)) in enumerate(sources)
-        dest = String(strip(dst, '/'))
-        add_image_member!(entries, dest, string(i, "/."), true)
-        walk_image_source!(entries, i, host, "", dest)
-    end
-    return [m for (_, (m, _)) in sort(collect(entries); by=first)]
+    return any(max_directory_ctime(path) > prev_ctime for path in values(paths))
 end
 
 """
@@ -158,45 +93,33 @@ somewhat by quick-scanning the directory for changes and only rebuilding if chan
 are detected.
 """
 function build_docker_image(mounts::Dict, uid::Cint, gid::Cint; verbose::Bool = false)
-    sources = docker_image_sources(mounts)
-    image_name = docker_image_name(sources, uid, gid)
-    if should_build_docker_image(sources, uid, gid)
-        max_ctime = maximum(max_directory_ctime(host) for (_, host) in sources)
+    overlayed_paths = Dict(path => m.host_path for (path, m) in mounts if m.type == MountType.Overlayed)
+    image_name = docker_image_name(overlayed_paths, uid, gid)
+    if should_build_docker_image(overlayed_paths, uid, gid)
+        max_ctime = maximum(max_directory_ctime(path) for path in values(overlayed_paths))
         if verbose
             @info("Building docker image $(image_name) with max timestamp 0x$(string(round(UInt64, max_ctime), base=16))")
         end
 
-        # We're going to tar up all Overlayed mounts.  Each source is reached through a
-        # symlink named after its index, so that `--transform` can turn the members of each
-        # into their destination paths.
-        mktempdir() do staging_dir
-            members_file = joinpath(staging_dir, "members")
-            for (i, (_, host)) in enumerate(sources)
-                symlink(host, joinpath(staging_dir, string(i)))
-            end
-            write(members_file, join(docker_image_members(sources) .* '\0'))
-            tar_cmds = String["-C", staging_dir]
-            for (i, (dst, _)) in enumerate(sources)
-                dst_prefix = dst == "/" ? "./" : "./$(dst[2:end])/"
-                push!(tar_cmds, "--transform=s&^$(i)/\\.\$&$(dst_prefix)&")
-                push!(tar_cmds, "--transform=s&^$(i)/&$(dst_prefix)&")
-            end
-            append!(tar_cmds, ["--no-recursion", "--null", "-T", members_file])
+        # We're going to tar up all Overlayed mounts, using `--transform` to convert our host paths
+        # to the required destination paths.
+        tar_cmds = String[]
+        append!(tar_cmds, ["--transform=s&$(host[2:end])&$(dst[2:end])&" for (dst, host) in overlayed_paths])
+        append!(tar_cmds, [host for (_, host) in overlayed_paths])
 
-            # Build the docker image
-            open(`$(docker_exe()) import - $(image_name)`, "w", verbose ? stdout : devnull) do io
-                # We need to record permissions, and therefore we cannot use Tar.jl.
-                # Some systems (e.g. macOS) ship with a BSD tar that does not support the
-                # `--owner` and `--group` command-line options. Therefore, if Tar_jll is
-                # available, we use the GNU tar provided by Tar_jll. If Tar_jll is not available,
-                # we fall back to the system tar.
-                tar = Tar_jll.is_available() ? Tar_jll.tar() : `tar`
-                run(pipeline(
-                    `$(tar) -c --owner=$(uid) --group=$(gid) $(tar_cmds)`,
-                    stdout=io,
-                    stderr=verbose ? stderr : devnull,
-                ))
-            end
+        # Build the docker image
+        open(`$(docker_exe()) import - $(image_name)`, "w", verbose ? stdout : devnull) do io
+            # We need to record permissions, and therefore we cannot use Tar.jl.
+            # Some systems (e.g. macOS) ship with a BSD tar that does not support the
+            # `--owner` and `--group` command-line options. Therefore, if Tar_jll is
+            # available, we use the GNU tar provided by Tar_jll. If Tar_jll is not available,
+            # we fall back to the system tar.
+            tar = Tar_jll.is_available() ? Tar_jll.tar() : `tar`
+            run(pipeline(
+                `$(tar) -c --owner=$(uid) --group=$(gid) $(tar_cmds)`,
+                stdout=io,
+                stderr=verbose ? stderr : devnull,
+            ))
         end
 
         # Record that we built it
@@ -226,6 +149,12 @@ function build_executor_command(exe::DockerExecutor, config::SandboxConfig, user
 end
 
 function build_executor_command(exe::DockerExecutor, config::SandboxConfig, user_cmd::Cmd)
+    for (sandbox_path, mount_info) in config.mounts
+        if length(mount_info.host_paths) > 1
+            throw(ArgumentError("DockerExecutor does not support mounts with several host paths (at $(sandbox_path))"))
+        end
+    end
+
     # Build the docker image that corresponds to this rootfs
     image_name = build_docker_image(config.mounts, config.uid, config.gid; verbose=config.verbose)
 
