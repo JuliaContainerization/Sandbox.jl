@@ -61,27 +61,6 @@ void mkpath(const char * dir) {
   check((0 == result) || (errno == EEXIST));
 }
 
-int isdir(const char * path) {
-  struct stat path_stat;
-  int result = stat(path, &path_stat);
-
-  // Silently ignore calling `isdir()` on a non-existant path
-  check((0 == result) || (errno == ENOENT) || (errno == ENOTDIR));
-  return S_ISDIR(path_stat.st_mode);
-}
-
-int unlink_callback(const char *fpath, const struct stat * a, int b, struct FTW * c) {
-  int rv = remove(fpath);
-  if (rv) {
-    fprintf(stderr, "remove failed: %d (%s)\n", errno, strerror(errno));
-  }
-  return rv;
-}
-
-void rmrf(const char * path) {
-  nftw(path, unlink_callback, 64, FTW_DEPTH | FTW_PHYS);
-}
-
 /**** Paths inside the sandbox *****
  *
  * Mount destinations are looked up in the rootfs before we enter it.  The rootfs, and
@@ -418,7 +397,7 @@ uint8_t mount_overlay(const char * const * lowers, size_t num_lowers, const char
   n = snprintf(opts + len, opts_size - len, ",upperdir=%s,workdir=%s,index=off%s", upper, work, userxattr_opt);
   check(n > 0 && (size_t)n < opts_size - len);
 
-  // We don't use `check()` here, because we want to be able to handle this in `userns_overlay_probe()`
+  // Not `check()`: the caller may try again with other options.
   uint8_t ok = TRUE;
   int saved_errno = 0;
   if (0 != mount("overlay", dest, "overlay", flags, opts)) {

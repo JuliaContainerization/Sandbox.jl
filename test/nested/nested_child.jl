@@ -18,31 +18,23 @@ Pkg.precompile()
 using Sandbox, Test
 @test pkgdir(Sandbox) == dirname(dirname(@__DIR__))
 
-rootfs_dir = Sandbox.debian_rootfs()
-
-inner_stderr = IOBuffer()
-config = SandboxConfig(
-    # This rootfs was downloaded within the sandbox in the `Pkg.instantiate()` above
-    Dict("/" => rootfs_dir),
-    # Propagate our readwrite mounting into the nested sandbox
-    Dict{String,String}("/tmp/readwrite" => "/tmp/readwrite"),
-    persist=true,
+# This rootfs was downloaded within the sandbox in the `Pkg.instantiate()` above, and the
+# outer sandbox's root can't hold the changes of another overlay, so they go to a
+# directory from outside.
+config = SandboxConfig(;
+    rootfs=Sandbox.debian_rootfs(),
+    mounts=["/tmp/readwrite" => Bind("/tmp/readwrite"; writable=true)],
+    persist=mktempdir("/sandbox_persistence"; cleanup=false),
     verbose=true,
-    stderr=inner_stderr,
 )
 
 # Prove that we can write into the `readwrite` location
-open("/tmp/readwrite/single_nested.txt", "w") do io
-    println(io, "aperture")
-end
+write("/tmp/readwrite/single_nested.txt", "aperture\n")
 
-# For debugging, dump the list of mounts:
-#run(`mount`)
-
-with_executor() do exe
-    @test success(exe, config, `/bin/sh -c "echo science > /tmp/readwrite/double_nested.txt"`)
-end
-@test String(read("/tmp/readwrite/double_nested.txt")) == "science\n"
+inner_stderr = IOBuffer()
+@test success(pipeline(Sandbox.command(config, `/bin/sh -c "echo science > /tmp/readwrite/double_nested.txt"`);
+                       stderr=inner_stderr))
+@test read("/tmp/readwrite/double_nested.txt", String) == "science\n"
 
 # The launcher's mode is what it is told, also when started as root in the sandbox.
 inner_log = String(take!(inner_stderr))
