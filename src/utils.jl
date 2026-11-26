@@ -192,23 +192,6 @@ function get_kernel_version(;verbose::Bool = false)
 end
 
 """
-    get_loaded_modules()
-
-Returns a list of modules currently loaded by the system.  On non-Linux platforms,
-returns an empty list.
-"""
-function get_loaded_modules()
-    @static if !Sys.islinux()
-        return Vector{String}[]
-    end
-
-    !isfile("/proc/modules") && return Vector{SubString{String}}[]
-    filter!(split.(readlines("/proc/modules"))) do (name, size, count, deps, state, addr)
-        state == "Live"
-    end
-end
-
-"""
     getuid()
 
 Wrapper around libc's `getuid()` function

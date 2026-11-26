@@ -106,6 +106,12 @@ function check_kernel_version(;verbose::Bool = false)
     return true
 end
 
+"""
+    check_overlayfs_loaded(;verbose::Bool = false)
+
+Return `true` if the kernel can mount `overlay` filesystems, i.e. `/proc/filesystems` lists
+`overlay`, whether built into the kernel or loaded as a module.
+"""
 function check_overlayfs_loaded(;verbose::Bool = false)
     if !Sys.islinux()
         return false
@@ -116,24 +122,17 @@ function check_overlayfs_loaded(;verbose::Bool = false)
         return true
     end
 
-    mods = get_loaded_modules()
-    if verbose
-        @info("Found $(length(mods)) loaded modules")
-    end
-
-    filter!(mods) do (name, size, count, deps, state, addr)
-        return name == "overlay"
-    end
-    if isempty(mods)
+    if !isfile("/proc/filesystems") ||
+       !any(line -> last(split(line, '\t')) == "overlay", readlines("/proc/filesystems"))
         @warn("""
-              The `overlay` kernel module is needed for the UserNS executors, but could not find it loaded.
+              The `overlay` filesystem is needed for the UserNS executors, but `/proc/filesystems` does not list it.
               Try `sudo modprobe overlay` or export SANDBOX_SKIP_OVERLAYFS_CHECK=true to disable this check!
               """)
         return false
     end
 
     if verbose
-        @info("Found loaded `overlay` module")
+        @info("Found `overlay` in /proc/filesystems")
     end
     return true
 end
